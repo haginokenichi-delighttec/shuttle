@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+output/*
+!output/.gitkeep
+
+# 実データは個人情報を含む可能性があるため管理対象外
+data/real/
