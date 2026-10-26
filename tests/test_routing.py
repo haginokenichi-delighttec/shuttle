@@ -146,3 +146,72 @@ def test_dummy_day_is_valid(tmp_path):
     plan = plan_day(day, prov, cfg)
     assert plan.ok
     assert validate(day, plan.planned, prov, cfg, allow_dropped=plan.dropped) == []
+
+
+def test_google_maps_url():
+    from shuttle_opt.routing.maps import route_url
+    url = route_url([(36.1, 137.9), (36.2, 137.95)], (36.25, 137.98))
+    assert url == ("https://www.google.com/maps/dir/?api=1"
+                   "&waypoints=36.100000,137.900000%7C36.200000,137.950000"
+                   "&destination=36.250000,137.980000&travelmode=driving&dir_action=navigate")
+    assert "origin=" not in url
+
+
+def test_google_maps_preview_url():
+    from shuttle_opt.routing.maps import route_url
+    url = route_url([(36.1, 137.9)], (36.25, 137.98), preview=True)
+    assert url == ("https://www.google.com/maps/dir/?api=1&origin=36.250000,137.980000"
+                   "&waypoints=36.100000,137.900000"
+                   "&destination=36.250000,137.980000&travelmode=driving")
+
+
+def _load_fetch_tool():
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "tools" / "fetch_google_matrix.py"
+    spec = importlib.util.spec_from_file_location("fetch_google_matrix", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_fetch_matrix_plan_blocks():
+    fm = _load_fetch_tool()
+    ids = [f"U{i:02d}" for i in range(30)]
+    blocks = fm.plan_blocks(ids, set(ids), set(), block=25)
+    assert len(blocks) == 4
+    assert all(len(o) * len(d) <= 625 for o, d in blocks)
+    # 全部取得済みで座標変更なし → 取得なし
+    done = {(a, b) for a in ids for b in ids if a != b}
+    assert fm.plan_blocks(ids, set(), done) == []
+    # 1人だけ新規 → その人の行と列だけ
+    blocks = fm.plan_blocks(ids + ["NEW"], {"NEW"}, done)
+    n = sum(len(o) * len(d) for o, d in blocks)
+    assert n < 2 * 31 + 31
+
+
+def test_fetch_matrix_end_to_end_with_fake_api(tmp_path, monkeypatch):
+    fm = _load_fetch_tool()
+    pd.DataFrame([{"lat": 35.0, "lng": 135.0}]).to_csv(tmp_path / "facility.csv", index=False)
+    pd.DataFrame([{"user_id": f"U{i}", "lat": 35.0 + 0.01 * i, "lng": 135.0} for i in range(1, 4)]).to_csv(
+        tmp_path / "users.csv", index=False)
+    calls = []
+
+    def fake_post(key, origins, dests, pref):
+        calls.append((len(origins), len(dests)))
+        return [{"originIndex": i, "destinationIndex": j, "duration": f"{60 * (i + j) + 30}s",
+                 "distanceMeters": 1000, "condition": "ROUTE_EXISTS", "status": {}}
+                for i in range(len(origins)) for j in range(len(dests))]
+
+    monkeypatch.setenv("GOOGLE_MAPS_API_KEY", "dummy")
+    assert fm.main(["--data", str(tmp_path)], post=fake_post) == 0
+    df = pd.read_csv(tmp_path / "travel_matrix.csv")
+    assert len(df) == 4 * 3                    # 4地点の自分以外の組
+    assert (df["minutes"] >= 1).all()
+    # 2回目は取得なし
+    calls.clear()
+    assert fm.main(["--data", str(tmp_path)], post=fake_post) == 0
+    assert calls == []
+    # 計画側で読み込めること
+    from shuttle_opt.routing.travel_time import CachedMatrixProvider
+    prov = CachedMatrixProvider(tmp_path / "travel_matrix.csv")
+    assert prov.minutes("DEPOT", "U1") >= 1

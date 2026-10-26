@@ -7,7 +7,7 @@
     python -m shuttle_opt.routing.main 2026-11-09 2026-11-10 --early 45
 
 出力（--out 配下）
-    routes_<date>.csv     ルート単位（職員・車・便・出発・帰着・人数・順路）
+    routes_<date>.csv     ルート単位（職員・車・便・出発・帰着・人数・順路・GoogleマップURL・確認用URL）
     stops_<date>.csv      停車地単位（訪問順・到着予定時刻）
     timeline_<date>.txt   職員ごとのタイムライン
     summary.csv           日ごとの結果一覧（複数日を計画したとき）
@@ -25,6 +25,7 @@ import pandas as pd
 
 from .config import RoutingConfig
 from .data import list_dates, load_day, min_to_hm, norm_date
+from .maps import route_url
 from .pipeline import describe, plan_day
 from .travel_time import DEPOT, CachedMatrixProvider, HaversineProvider
 from .validate import validate
@@ -53,8 +54,14 @@ def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
     day = load_day(args.data, date)
     points = {DEPOT: day.facility, **{u.user_id: (u.lat, u.lng) for u in day.users.values()}}
     provider = HaversineProvider(points, cfg.detour, cfg.speed_kmh)
-    if args.matrix:
-        provider = CachedMatrixProvider(args.matrix, fallback=provider)
+    matrix = args.matrix
+    if matrix is None and not args.no_matrix and (Path(args.data) / "travel_matrix.csv").exists():
+        matrix = Path(args.data) / "travel_matrix.csv"   # Google API で取得した表があれば自動で使う
+    if matrix:
+        provider = CachedMatrixProvider(matrix, fallback=provider)
+        print(f"移動時間: {matrix}（表にない組は直線距離から推計）")
+    else:
+        print(f"移動時間: 直線距離 × {cfg.detour} ÷ 時速{cfg.speed_kmh:g}km で推計")
 
     print(f"対象日 {day.date}: 職員 {len(day.staff)} 名 / 使える車 {len(day.cars)} 台 / "
           f"利用者 {len(day.users)} 名 / 便 {len(day.waves)}")
@@ -83,7 +90,10 @@ def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
         rows.append({"route_id": r.route_id, "便": r.wave_id, "職員": p.staff_id, "車": p.car_id,
                      "施設出発": min_to_hm(p.start), "施設帰着": min_to_hm(p.end),
                      "人数": r.seats, "歩行器": r.walkers, "車椅子": r.wheelchairs, "最大介助": r.max_need,
-                     "走行分": r.travel, "順路": " → ".join(r.stops)})
+                     "走行分": r.travel, "順路": " → ".join(r.stops),
+                     "GoogleマップURL": route_url(pts := [(day.users[u].lat, day.users[u].lng) for u in r.stops],
+                                                  day.facility),
+                     "確認用URL": route_url(pts, day.facility, preview=True)})
         for i, (u, t) in enumerate(zip(r.stops, p.eta), start=1):
             stops.append({"route_id": r.route_id, "職員": p.staff_id, "車": p.car_id, "順番": i,
                           "利用者": u, "到着予定": min_to_hm(t)})
@@ -102,7 +112,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--date", action="append", default=[], help="対象日（dates と同じ。複数指定可）")
     ap.add_argument("--data", default="data/sample_routing")
     ap.add_argument("--out", default="output/routing")
-    ap.add_argument("--matrix", default=None, help="移動時間キャッシュCSV（from_id,to_id,minutes）")
+    ap.add_argument("--matrix", default=None,
+                    help="移動時間の表CSV（from_id,to_id,minutes）。省略時は <data>/travel_matrix.csv があれば使う")
+    ap.add_argument("--no-matrix", action="store_true", help="移動時間の表を使わず直線距離で推計する")
     ap.add_argument("--early", type=int, default=None, help="迎えの早着許容（分）")
     ap.add_argument("--late", type=int, default=None, help="送りの出発遅れ許容（分）")
     ap.add_argument("--time-limit", type=int, default=None, help="Stage B の計算時間上限（秒）")

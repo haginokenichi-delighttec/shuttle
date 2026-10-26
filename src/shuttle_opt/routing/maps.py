@@ -1,0 +1,43 @@
+"""Google マップでルートを開く URL（Maps URLs. API キー不要）.
+
+    https://www.google.com/maps/dir/?api=1
+        &waypoints=利用者宅1の緯度,経度|利用者宅2|...
+        &destination=施設の緯度,経度
+        &travelmode=driving&dir_action=navigate
+
+- ナビ用: origin（出発地）は指定しない → 現在地（施設の駐車場）から案内が始まる。
+  origin を付けるとナビではなく経路確認画面になる仕様のため。
+- 確認用: origin＝施設を付け、dir_action は付けない（PCでも施設からの経路全体を確認できる）。
+- 立ち寄り先はソルバーが決めた訪問順のまま並べる。
+- Google の仕様上、立ち寄り先の数には上限がある（ブラウザでは最大9か所、モバイルブラウザではさらに少ない）。
+
+注意: URL には利用者宅の座標が入るため、出力ファイルは個人情報として扱うこと。
+"""
+from __future__ import annotations
+
+from urllib.parse import urlencode
+
+BASE = "https://www.google.com/maps/dir/"
+
+
+def _ll(lat: float, lng: float) -> str:
+    return f"{lat:.6f},{lng:.6f}"
+
+
+def route_url(stops: list[tuple[float, float]], facility: tuple[float, float],
+              preview: bool = False) -> str:
+    """stops: 訪問順の (緯度, 経度). facility: 施設の (緯度, 経度).
+
+    preview=False: ナビ用。出発地なし → 開いた端末の現在地からナビが始まる
+    preview=True : 確認用。出発地＝施設 → ナビは始まらず、経路全体を表示する
+    """
+    params = {"api": "1"}
+    if preview:
+        params["origin"] = _ll(*facility)
+    if stops:
+        params["waypoints"] = "|".join(_ll(*p) for p in stops)
+    params["destination"] = _ll(*facility)
+    params["travelmode"] = "driving"
+    if not preview:
+        params["dir_action"] = "navigate"
+    return BASE + "?" + urlencode(params, safe=",")
