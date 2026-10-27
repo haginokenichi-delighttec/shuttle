@@ -32,6 +32,20 @@ def min_to_hm(m: int) -> str:
     return f"{m // 60:02d}:{m % 60:02d}"
 
 
+DEPOT = "DEPOT"   # 施設の地点ID
+
+
+def home_id(staff_id: str) -> str:
+    """職員の自宅の地点ID（移動時間の表・URL で使う）."""
+    return f"HOME_{staff_id}"
+
+
+def _float(v) -> float | None:
+    if v is None or (isinstance(v, float) and pd.isna(v)) or str(v).strip() == "":
+        return None
+    return float(v)
+
+
 @dataclass
 class Staff:
     staff_id: str
@@ -39,6 +53,9 @@ class Staff:
     care_skill: int
     start: int          # 当日のシフト開始（分）
     end: int
+    home: tuple[float, float] | None = None   # 自宅の (緯度, 経度)
+    direct_start: bool = False   # 直行: 朝は自宅から迎えに出る
+    direct_end: bool = False     # 直帰: 夕方は送りの後そのまま自宅へ帰る
 
 
 @dataclass
@@ -81,6 +98,21 @@ class DayProblem:
     cars: dict[str, Car]
     users: dict[str, User]
     waves: list[Wave]
+    ng_pairs: set[frozenset[str]] = field(default_factory=set)   # 同じ車に乗せない利用者の組
+
+    def points(self) -> dict[str, tuple[float, float]]:
+        """地点ID → (緯度, 経度). 施設・当日の利用者・直行直帰する職員の自宅."""
+        pts = {DEPOT: self.facility}
+        pts.update({u.user_id: (u.lat, u.lng) for u in self.users.values()})
+        for s in self.staff.values():
+            if s.home and (s.direct_start or s.direct_end):
+                pts[home_id(s.staff_id)] = s.home
+        return pts
+
+    def ng_ok(self, stops: list[str]) -> bool:
+        """同乗NGの組が含まれていなければ True."""
+        st = set(stops)
+        return not any(pair <= st for pair in self.ng_pairs)
 
     def pairs(self) -> list[tuple[str, str]]:
         """当日の候補ペア (staff_id, car_id).
@@ -138,8 +170,13 @@ def load_day(data_dir: str | Path, date: str) -> DayProblem:
         if r.staff_id not in shift.index:
             continue   # 当日休み
         sh = shift.loc[r.staff_id]
+        lat, lng = _float(getattr(r, "home_lat", None)), _float(getattr(r, "home_lng", None))
+        home = (lat, lng) if lat is not None and lng is not None else None
+        ds, de = bool(_int(getattr(r, "direct_start", 0))), bool(_int(getattr(r, "direct_end", 0)))
+        if (ds or de) and home is None:
+            raise ValueError(f"staff.csv: {r.staff_id} は直行/直帰ですが自宅座標（home_lat, home_lng）がありません")
         staff[r.staff_id] = Staff(r.staff_id, int(r.priority), int(r.care_skill),
-                                  hm_to_min(sh["start"]), hm_to_min(sh["end"]))
+                                  hm_to_min(sh["start"]), hm_to_min(sh["end"]), home, ds, de)
 
     cars = {}
     for r in df_cars.itertuples(index=False):
@@ -172,4 +209,13 @@ def load_day(data_dir: str | Path, date: str) -> DayProblem:
         waves.append(Wave(f"送り{p.depart}_{p.plan_id}", "dropoff", hm_to_min(p.depart), p.plan_id, uids))
     waves.sort(key=lambda w: w.time)
 
-    return DayProblem(date, (float(fac["lat"]), float(fac["lng"])), staff, cars, users, waves)
+    ng: set[frozenset[str]] = set()
+    if (d / "ng_pairs.csv").exists():
+        df_ng = pd.read_csv(d / "ng_pairs.csv", dtype=str)
+        df_ng.columns = [c.strip() for c in df_ng.columns]
+        for r in df_ng.itertuples(index=False):
+            a, b = str(r.user_a).strip(), str(r.user_b).strip()
+            if a and b and a != b and a != "nan" and b != "nan":
+                ng.add(frozenset((a, b)))
+
+    return DayProblem(date, (float(fac["lat"]), float(fac["lng"])), staff, cars, users, waves, ng)

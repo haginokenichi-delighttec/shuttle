@@ -1,7 +1,8 @@
 """パラメータ（時間はすべて分）."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -14,6 +15,18 @@ class RoutingConfig:
     early_eps: int = 20          # 迎え: 到着時刻の何分前から着いてよいか
     late_eps: int = 10           # 送り: 出発時刻から何分遅れて出てよいか
     day_start: str = "07:30"     # これより前には施設を出ない
+
+    # 昼休み（勤務時間が lunch_start〜lunch_end をすべて含む職員が対象）
+    lunch_enabled: bool = True
+    lunch_start: str = "11:30"   # この時間帯の中で
+    lunch_end: str = "13:30"
+    lunch_min: int = 30          # 連続して最低何分休むか
+    lunch_max: int = 60          # 休憩は最大何分か（出力する休憩時間の上限）
+
+    # 送り→迎えの連結（送りで全員降ろしたら施設に戻らず次の迎えへ）
+    chain_enabled: bool = True
+    chain_max_wait: int = 60     # 送り終わりから次の迎えまで、空車で待ってよい最大分数
+    chain_per_route: int = 3     # 送りルート1本につき作る連結候補の数
 
     # 運用
     turnaround_min: int = 10     # ルートの間に必要な準備時間（職員・車とも）
@@ -31,5 +44,5 @@ class RoutingConfig:
     w_time_shift: int = 1        # 迎えの早着・送りの出発遅れ（1分あたり）
     drop_penalty: int = 100_000  # 利用者を乗せられないときのペナルティ
     assign_time_limit_sec: int = 30
-    num_workers: int = 8         # CP-SAT の並列数
+    num_workers: int = field(default_factory=lambda: max(1, min(8, os.cpu_count() or 1)))  # CP-SAT の並列数（CPUコア数まで）
     start_step: int = 5          # 出発時刻の候補の刻み（分）

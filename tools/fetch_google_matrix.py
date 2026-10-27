@@ -49,6 +49,15 @@ def load_points(data_dir: Path) -> dict[str, tuple[float, float]]:
     with open(data_dir / "users.csv", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             pts[r["user_id"].strip()] = (float(r["lat"]), float(r["lng"]))
+    # 直行・直帰する職員の自宅（staff.csv の home_lat, home_lng）
+    staff_csv = data_dir / "staff.csv"
+    if not staff_csv.exists():
+        return pts
+    with open(staff_csv, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            r = {k.strip(): (v or "").strip() for k, v in r.items()}
+            if r.get("home_lat") and r.get("home_lng") and (r.get("direct_start") == "1" or r.get("direct_end") == "1"):
+                pts[f"HOME_{r['staff_id']}"] = (float(r["home_lat"]), float(r["home_lng"]))
     return pts
 
 
@@ -73,21 +82,33 @@ def _chunks(xs: list[str], n: int) -> list[list[str]]:
 
 def plan_blocks(ids: list[str], stale: set[str], done: set[tuple[str, str]],
                 block: int = BLOCK) -> list[tuple[list[str], list[str]]]:
-    """取得が必要な (出発地リスト, 到着地リスト) の組を作る.
+    """取得が必要な (出発地リスト, 到着地リスト) の組を作る（1組 block×block 件まで）.
 
     stale = 座標が新しい／変わった地点。これに関わる組と、表にない組を取得する。
+    1. stale の地点 → 全地点
+    2. それ以外の地点 → stale の地点
+    3. それ以外どうしで表にない組
     """
-    def needed(a: str, b: str) -> bool:
-        return a != b and (a in stale or b in stale or (a, b) not in done)
+    stale_l = [i for i in ids if i in stale]
+    rest = [i for i in ids if i not in stale]
+    blocks: list[tuple[list[str], list[str]]] = []
 
-    blocks = []
-    for os_ in _chunks(ids, block):
+    def push(os_: list[str], ds: list[str], need) -> None:
+        o = [a for a in os_ if any(need(a, b) for b in ds)]
+        if not o:
+            return
+        d = [b for b in ds if any(need(a, b) for a in o)]
+        blocks.append((o, d))
+
+    for os_ in _chunks(stale_l, block):
         for ds in _chunks(ids, block):
-            o_need = [a for a in os_ if any(needed(a, b) for b in ds)]
-            if not o_need:
-                continue
-            d_need = [b for b in ds if any(needed(a, b) for a in o_need)]
-            blocks.append((o_need, d_need))
+            push(os_, ds, lambda a, b: a != b)
+    for os_ in _chunks(rest, block):
+        for ds in _chunks(stale_l, block):
+            push(os_, ds, lambda a, b: a != b)
+    for os_ in _chunks(rest, block):
+        for ds in _chunks(rest, block):
+            push(os_, ds, lambda a, b: a != b and (a, b) not in done)
     return blocks
 
 
@@ -176,7 +197,8 @@ def main(argv: list[str] | None = None, post=post_matrix) -> int:
     blocks = plan_blocks(ids, stale, done)
     n_elem = sum(len(o) * len(d) for o, d in blocks)
 
-    print(f"地点数: {len(ids)}（施設＋利用者 {len(ids) - 1} 名）")
+    n_home = sum(1 for i in ids if i.startswith("HOME_"))
+    print(f"地点数: {len(ids)}（施設＋利用者 {len(ids) - 1 - n_home} 名＋職員の自宅 {n_home} 件）")
     print(f"取得済み: {len(done)} 件 / 新規・座標変更の地点: {len(stale)}")
     print(f"今回の取得: {n_elem} 件（リクエスト {len(blocks)} 回、"
           f"1分あたり {args.epm} 件までのペースで約 {math.ceil(n_elem / max(1, args.epm))} 分）")

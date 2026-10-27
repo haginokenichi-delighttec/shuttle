@@ -40,8 +40,7 @@ def small(tmp_path):
 
 
 def _provider(day, cfg):
-    pts = {DEPOT: day.facility, **{u.user_id: (u.lat, u.lng) for u in day.users.values()}}
-    return HaversineProvider(pts, cfg.detour, cfg.speed_kmh)
+    return HaversineProvider(day.points(), cfg.detour, cfg.speed_kmh)
 
 
 def test_time_conversion():
@@ -215,3 +214,118 @@ def test_fetch_matrix_end_to_end_with_fake_api(tmp_path, monkeypatch):
     from shuttle_opt.routing.travel_time import CachedMatrixProvider
     prov = CachedMatrixProvider(tmp_path / "travel_matrix.csv")
     assert prov.minutes("DEPOT", "U1") >= 1
+
+
+def test_ng_pair_never_share_a_car(tmp_path):
+    users = [(f"U{i}", 35.0 + 0.002 * i, 135.0, 1, 0, 1, 3) for i in range(1, 5)]
+    _write(tmp_path, users, [("S1", 5, 3), ("S2", 4, 3)],
+           [(DATE, "S1", "07:30", "17:00"), (DATE, "S2", "07:30", "17:00")],
+           [("C1", 4, 0, ""), ("C2", 4, 0, "")], [("P1", "09:00", "12:00")],
+           [(DATE, f"U{i}", "P1") for i in range(1, 5)])
+    pd.DataFrame([{"user_a": "U1", "user_b": "U2"}]).to_csv(tmp_path / "ng_pairs.csv", index=False)
+    cfg = RoutingConfig(assign_time_limit_sec=10)
+    day = load_day(tmp_path, DATE)
+    prov = _provider(day, cfg)
+    plan = plan_day(day, prov, cfg)
+    assert plan.dropped == {}
+    for p in plan.planned:
+        assert not {"U1", "U2"} <= set(p.route.stops)
+    assert validate(day, plan.planned, prov, cfg) == []
+
+
+def test_direct_commute_starts_and_ends_at_home(tmp_path):
+    users = [(f"U{i}", 35.0 + 0.003 * i, 135.0, 1, 0, 1, 3) for i in range(1, 4)]
+    _write(tmp_path, users, [("S1", 5, 3)], [(DATE, "S1", "07:30", "17:00")],
+           [("C1", 4, 0, "S1")], [("P1", "09:00", "12:00")],
+           [(DATE, f"U{i}", "P1") for i in range(1, 4)])
+    df = pd.read_csv(tmp_path / "staff.csv")
+    df["home_lat"], df["home_lng"], df["direct_start"], df["direct_end"] = 35.02, 135.01, 1, 1
+    df.to_csv(tmp_path / "staff.csv", index=False)
+    cfg = RoutingConfig(assign_time_limit_sec=10)
+    day = load_day(tmp_path, DATE)
+    prov = _provider(day, cfg)
+    plan = plan_day(day, prov, cfg)
+    assert plan.dropped == {}
+    ps = sorted(plan.planned, key=lambda p: p.start)
+    assert ps[0].route.kind == "pickup" and ps[0].route.start_pt == "HOME_S1"
+    assert ps[-1].route.kind == "dropoff" and ps[-1].route.end_pt == "HOME_S1"
+    assert validate(day, plan.planned, prov, cfg) == []
+    from shuttle_opt.routing.maps import route_url
+    url = route_url([(35.0, 135.0)], (35.02, 135.01), preview=True, origin=(35.1, 135.1))
+    assert "origin=35.100000,135.100000" in url and "destination=35.020000,135.010000" in url
+
+
+def test_lunch_break_is_kept(tmp_path):
+    """11:30〜13:30 に連続30分の休憩が取れること（1人で昼をまたぐ便を回す日）."""
+    users = [(f"U{i}", 35.0 + 0.01 * i, 135.0, 1, 0, 1, 5) for i in range(1, 4)]
+    _write(tmp_path, users, [("S1", 5, 3)], [(DATE, "S1", "08:00", "17:00")],
+           [("C1", 4, 0, "")], [("P1", "09:00", "12:00"), ("P2", "13:30", "16:00")],
+           [(DATE, "U1", "P1"), (DATE, "U2", "P1"), (DATE, "U3", "P2")])
+    cfg = RoutingConfig(assign_time_limit_sec=10)
+    day = load_day(tmp_path, DATE)
+    prov = _provider(day, cfg)
+    plan = plan_day(day, prov, cfg)
+    assert plan.ok and plan.dropped == {}
+    b = plan.breaks["S1"]
+    assert b is not None and 30 <= b[1] - b[0] <= 60
+    assert hm_to_min("11:30") <= b[0] and b[1] <= hm_to_min("13:30")
+    assert validate(day, plan.planned, prov, cfg) == []
+
+
+def test_lunch_find_break():
+    from shuttle_opt.routing import lunch
+    from shuttle_opt.routing.data import Staff
+    from shuttle_opt.routing.route_gen import PlannedRoute, Route
+    cfg = RoutingConfig()
+    st = Staff("S1", 3, 3, hm_to_min("08:00"), hm_to_min("17:00"))
+    r = Route("r", "w", "dropoff", ["U1"], [5], 40, 1, 0, 1, 30)
+    # 12:00-12:40 送り（準備10分で 12:50 まで）→ 11:30-12:00 か 12:50-13:30 の長い方（40分）
+    planned = [PlannedRoute(r, "S1", "C1", hm_to_min("12:00"))]
+    assert lunch.find_break(st, planned, cfg) == (hm_to_min("12:50"), hm_to_min("13:30"))
+    # 何も担当しなければ 11:30 から60分
+    assert lunch.find_break(st, [], cfg) == (hm_to_min("11:30"), hm_to_min("12:30"))
+    # 11:40-13:10 の長いルート → 休憩が取れない
+    r2 = Route("r2", "w", "dropoff", ["U1"], [5], 90, 1, 0, 1, 30)
+    assert lunch.find_break(st, [PlannedRoute(r2, "S1", "C1", hm_to_min("11:40"))], cfg) is None
+
+
+def test_chain_dropoff_then_pickup(tmp_path):
+    """送りの最後の家の近くに次の迎えがあるとき、施設に戻らず連結ルートを使う."""
+    # 施設(35.0,135.0)から約5km北に利用者が集まっている
+    users = [("U1", 35.045, 135.0, 1, 0, 1, 3), ("U2", 35.046, 135.002, 1, 0, 1, 3)]
+    _write(tmp_path, users, [("S1", 5, 3)], [(DATE, "S1", "08:00", "17:00")],
+           [("C1", 4, 0, "")], [("P1", "09:00", "12:00"), ("P2", "13:00", "16:00")],
+           [(DATE, "U1", "P1"), (DATE, "U2", "P2")])
+    cfg = RoutingConfig(assign_time_limit_sec=10)
+    day = load_day(tmp_path, DATE)
+    prov = _provider(day, cfg)
+    plan = plan_day(day, prov, cfg)
+    assert plan.dropped == {}
+    chains = [p for p in plan.planned if p.route.is_chain]
+    assert len(chains) == 1
+    c = chains[0]
+    assert c.route.stops == ["U1", "U2"] and c.end == hm_to_min("13:00")
+    a, b = c.idle
+    assert 0 <= b - a <= cfg.chain_max_wait
+    assert validate(day, plan.planned, prov, cfg) == []
+    # 連結なしの設定では使わない
+    cfg2 = RoutingConfig(assign_time_limit_sec=10, chain_enabled=False)
+    plan2 = plan_day(day, prov, cfg2)
+    assert not any(p.route.is_chain for p in plan2.planned)
+    # 連結なしだと乗せられない人が出るか、走行時間が長くなる
+    assert plan2.dropped or plan.total_travel < plan2.total_travel
+
+
+def test_lunch_can_be_taken_during_chain_wait():
+    from shuttle_opt.routing import lunch
+    from shuttle_opt.routing.data import Staff
+    from shuttle_opt.routing.route_gen import PlannedRoute, Route
+    cfg = RoutingConfig()
+    st = Staff("S1", 3, 3, hm_to_min("08:00"), hm_to_min("17:00"))
+    # 11:20 出発の送り（11:50 まで）→ 空車待機 11:50〜12:40 → 迎え 12:40〜13:00 施設着
+    r = Route("c", "w1", "chain", ["U1", "U2"], [10], 100, 1, 0, 1, 40,
+              wave2="w2", n_first=1, fixed_end=hm_to_min("13:00"), idle_from=30, tail_len=20, tail_offsets=[-20])
+    p = PlannedRoute(r, "S1", "C1", hm_to_min("11:20"))
+    assert p.idle == (hm_to_min("11:50"), hm_to_min("12:40"))
+    br = lunch.find_break(st, [p], cfg)
+    assert br == (hm_to_min("11:50"), hm_to_min("12:40"))

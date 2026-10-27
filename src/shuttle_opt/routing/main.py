@@ -7,9 +7,10 @@
     python -m shuttle_opt.routing.main 2026-11-09 2026-11-10 --early 45
 
 出力（--out 配下）
-    routes_<date>.csv     ルート単位（職員・車・便・出発・帰着・人数・順路・GoogleマップURL・確認用URL）
+    routes_<date>.csv     ルート単位（職員・車・便・出発地/時刻・到着地/時刻・人数・順路・GoogleマップURL・確認用URL）
     stops_<date>.csv      停車地単位（訪問順・到着予定時刻）
-    timeline_<date>.txt   職員ごとのタイムライン
+    timeline_<date>.txt   職員ごとのタイムライン（昼休みを含む）
+    breaks_<date>.csv     昼休み（職員・開始・終了・分）
     summary.csv           日ごとの結果一覧（複数日を計画したとき）
     logs/run_<日時>.log   実行中に画面に出た内容（デバッグ用）
 """
@@ -49,10 +50,14 @@ class _Tee:
         self.f.flush()
 
 
+def _place(pt: str) -> str:
+    return "施設" if pt == DEPOT else f"自宅({pt.removeprefix('HOME_')})"
+
+
 def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
     """1日分を計画して出力する. 戻り値は summary.csv の1行."""
     day = load_day(args.data, date)
-    points = {DEPOT: day.facility, **{u.user_id: (u.lat, u.lng) for u in day.users.values()}}
+    points = day.points()
     provider = HaversineProvider(points, cfg.detour, cfg.speed_kmh)
     matrix = args.matrix
     if matrix is None and not args.no_matrix and (Path(args.data) / "travel_matrix.csv").exists():
@@ -65,6 +70,13 @@ def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
 
     print(f"対象日 {day.date}: 職員 {len(day.staff)} 名 / 使える車 {len(day.cars)} 台 / "
           f"利用者 {len(day.users)} 名 / 便 {len(day.waves)}")
+    direct = [f"{s.staff_id}({'直行' * s.direct_start}{'・' * (s.direct_start and s.direct_end)}{'直帰' * s.direct_end})"
+              for s in day.staff.values() if s.direct_start or s.direct_end]
+    if direct:
+        print(f"直行・直帰する職員: {', '.join(direct)}")
+    ng_today = [" と ".join(sorted(p)) for p in day.ng_pairs if p <= set(day.users)]
+    if ng_today:
+        print(f"同乗NG（当日該当）: {' / '.join(ng_today)}")
     plan = plan_day(day, provider, cfg)
     print("\n".join(plan.log))
     summary = {"日付": day.date, "職員": len(day.staff), "車": len(day.cars), "利用者": len(day.users),
@@ -87,20 +99,32 @@ def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
     rows, stops = [], []
     for p in plan.planned:
         r = p.route
-        rows.append({"route_id": r.route_id, "便": r.wave_id, "職員": p.staff_id, "車": p.car_id,
-                     "施設出発": min_to_hm(p.start), "施設帰着": min_to_hm(p.end),
+        pts = [points[u] for u in r.stops]
+        label = f"{r.wave_id}→{r.wave2}" if r.is_chain else r.wave_id
+        idle = p.idle
+        rows.append({"route_id": r.route_id, "便": label, "職員": p.staff_id, "車": p.car_id,
+                     "出発地": _place(r.start_pt), "出発時刻": min_to_hm(p.start),
+                     "到着地": _place(r.end_pt), "到着時刻": min_to_hm(p.end),
                      "人数": r.seats, "歩行器": r.walkers, "車椅子": r.wheelchairs, "最大介助": r.max_need,
-                     "走行分": r.travel, "順路": " → ".join(r.stops),
-                     "GoogleマップURL": route_url(pts := [(day.users[u].lat, day.users[u].lng) for u in r.stops],
-                                                  day.facility),
-                     "確認用URL": route_url(pts, day.facility, preview=True)})
+                     "空車待機": f"{min_to_hm(idle[0])}-{min_to_hm(idle[1])}" if idle else "",
+                     "走行分": r.travel,
+                     "順路": (" → ".join(r.stops[:r.n_first]) + " ⇒ " + " → ".join(r.stops[r.n_first:]))
+                     if r.is_chain else " → ".join(r.stops),
+                     "GoogleマップURL": route_url(pts, points[r.end_pt]),
+                     "確認用URL": route_url(pts, points[r.end_pt], preview=True, origin=points[r.start_pt])})
+        seg_wave = {u: wid for wid, uids in r.segments() for u in uids}
         for i, (u, t) in enumerate(zip(r.stops, p.eta), start=1):
             stops.append({"route_id": r.route_id, "職員": p.staff_id, "車": p.car_id, "順番": i,
-                          "利用者": u, "到着予定": min_to_hm(t)})
+                          "便": seg_wave[u], "利用者": u, "到着予定": min_to_hm(t)})
     pd.DataFrame(rows).to_csv(out / f"routes_{day.date}.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(stops).to_csv(out / f"stops_{day.date}.csv", index=False, encoding="utf-8-sig")
     text = describe(day, plan)
     (out / f"timeline_{day.date}.txt").write_text(text, encoding="utf-8")
+    pd.DataFrame([{"職員": sid, "休憩開始": min_to_hm(b[0]) if b else "", "休憩終了": min_to_hm(b[1]) if b else "",
+                   "分": (b[1] - b[0]) if b else 0}
+                  for sid, b in sorted(plan.breaks.items())],
+                 columns=["職員", "休憩開始", "休憩終了", "分"]).to_csv(
+        out / f"breaks_{day.date}.csv", index=False, encoding="utf-8-sig")
     print(f"\n総走行時間 {plan.total_travel} 分 / ルート {len(plan.planned)} 本\n")
     print(text)
     return summary
