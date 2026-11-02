@@ -23,10 +23,17 @@ class RoutingConfig:
     lunch_min: int = 30          # 連続して最低何分休むか
     lunch_max: int = 60          # 休憩は最大何分か（出力する休憩時間の上限）
 
+    # 残業（常勤で定時 overtime_shift_end に終わる職員）
+    overtime_enabled: bool = True
+    overtime_shift_end: str = "17:00"
+    overtime_max: int = 60       # 最大何分まで
+    w_overtime: int = 100        # 残業1分あたりのペナルティ（乗せられない人を減らせるときだけ使う）
+
     # 送り→迎えの連結（送りで全員降ろしたら施設に戻らず次の迎えへ）
     chain_enabled: bool = True
     chain_max_wait: int = 60     # 送り終わりから次の迎えまで、空車で待ってよい最大分数
-    chain_per_route: int = 3     # 送りルート1本につき作る連結候補の数
+    chain_per_route: int = 6     # 送りルート1本につき作る連結候補の数
+    chain_min_saving: int = -15  # 施設に戻るより何分まで長くなっても候補にするか（時間的に間に合わせるため）
 
     # 運用
     turnaround_min: int = 10     # ルートの間に必要な準備時間（職員・車とも）
@@ -43,6 +50,7 @@ class RoutingConfig:
     w_max_load: int = 5          # 担当ルート数の最大値を抑える重み
     w_time_shift: int = 1        # 迎えの早着・送りの出発遅れ（1分あたり）
     drop_penalty: int = 100_000  # 利用者を乗せられないときのペナルティ
+    w_help_car: int = 10_000     # ヘルプ車を1台使うペナルティ（乗せられない人を減らせるときだけ使われる）
     assign_time_limit_sec: int = 30
     num_workers: int = field(default_factory=lambda: max(1, min(8, os.cpu_count() or 1)))  # CP-SAT の並列数（CPUコア数まで）
-    start_step: int = 5          # 出発時刻の候補の刻み（分）
+    start_step: int = 10         # 出発時刻の候補の刻み（分）。小さくすると細かくなるが計算が重くなる

@@ -94,7 +94,7 @@ def test_date_and_blank_normalization(tmp_path):
 
 def test_waves(small):
     day = load_day(small, DATE)
-    assert [w.wave_id for w in day.waves] == ["迎え09:00_P1", "迎え10:00_P2", "送り12:00_P1", "送り15:00_P2"]
+    assert [w.wave_id for w in day.waves] == ["迎え09:00", "迎え10:00", "送り12:00", "送り15:00"]
 
 
 def test_small_plan_covers_everyone(small):
@@ -129,7 +129,7 @@ def test_skill_shortage_is_reported(tmp_path):
     prov = _provider(day, cfg)
     plan = plan_day(day, prov, cfg)
     assert plan.ok
-    assert plan.dropped == {"迎え09:00_P1": ["U1"], "送り12:00_P1": ["U1"]}
+    assert plan.dropped == {"迎え09:00": ["U1"], "送り12:00": ["U1"]}
     assert validate(day, plan.planned, prov, cfg, allow_dropped=plan.dropped) == []
 
 
@@ -329,3 +329,73 @@ def test_lunch_can_be_taken_during_chain_wait():
     assert p.idle == (hm_to_min("11:50"), hm_to_min("12:40"))
     br = lunch.find_break(st, [p], cfg)
     assert br == (hm_to_min("11:50"), hm_to_min("12:40"))
+
+
+def test_help_car_only_when_needed(tmp_path):
+    # 通常車1台（定員2）で足りる日 → ヘルプ車は使わない
+    users = [(f"U{i}", 35.0 + 0.003 * i, 135.0, 1, 0, 1, 3) for i in range(1, 3)]
+    staff = [("S1", 5, 3), ("S2", 5, 3)]
+    shifts = [(DATE, "S1", "07:30", "17:00"), (DATE, "S2", "07:30", "17:00")]
+    _write(tmp_path, users, staff, shifts, [("C1", 2, 0, ""), ("H1", 4, 0, "")],
+           [("P1", "09:00", "12:00")], [(DATE, f"U{i}", "P1") for i in range(1, 3)])
+    df = pd.read_csv(tmp_path / "cars.csv")
+    df["help"] = [0, 1]
+    df.to_csv(tmp_path / "cars.csv", index=False)
+    cfg = RoutingConfig(assign_time_limit_sec=10)
+    day = load_day(tmp_path, DATE)
+    plan = plan_day(day, _provider(day, cfg), cfg)
+    assert plan.dropped == {}
+    assert all(p.car_id == "C1" for p in plan.planned)
+    # 利用者が増えて通常車だけでは乗せきれない → ヘルプ車を使う
+    users = [(f"U{i}", 35.0 + 0.003 * i, 135.0, 1, 0, 1, 3) for i in range(1, 5)]
+    _write(tmp_path, users, staff, shifts, [("C1", 2, 0, ""), ("H1", 4, 0, "")],
+           [("P1", "09:00", "12:00")], [(DATE, f"U{i}", "P1") for i in range(1, 5)])
+    df = pd.read_csv(tmp_path / "cars.csv")
+    df["help"] = [0, 1]
+    df.to_csv(tmp_path / "cars.csv", index=False)
+    day = load_day(tmp_path, DATE)
+    prov = _provider(day, cfg)
+    plan = plan_day(day, prov, cfg)
+    assert plan.dropped == {}
+    assert any(p.car_id == "H1" for p in plan.planned)
+    assert validate(day, plan.planned, prov, cfg) == []
+
+
+
+def test_attendance_with_times_merges_same_departure(tmp_path):
+    """プランIDではなく到着・出発時刻で持つ。出発時刻が同じ人は1つの送り便になる."""
+    users = [(f"U{i}", 35.0 + 0.003 * i, 135.0, 1, 0, 1, 3) for i in range(1, 4)]
+    _write(tmp_path, users, [("S1", 5, 3)], [(DATE, "S1", "08:00", "17:00")],
+           [("C1", 4, 0, "")], [("P1", "09:00", "12:00")], [(DATE, "U1", "P1")])
+    pd.DataFrame([{"date": DATE, "user_id": "U1", "arrive": "13:30", "depart": "16:30"},
+                  {"date": DATE, "user_id": "U2", "arrive": "14:30", "depart": "16:30"},
+                  {"date": DATE, "user_id": "U3", "arrive": "9:00", "depart": "12:00"}]).to_csv(
+        tmp_path / "attendance.csv", index=False)
+    (tmp_path / "plans.csv").unlink()
+    day = load_day(tmp_path, DATE)
+    waves = {w.wave_id: w.user_ids for w in day.waves}
+    assert waves == {"迎え09:00": ["U3"], "送り12:00": ["U3"], "迎え13:30": ["U1"],
+                     "迎え14:30": ["U2"], "送り16:30": ["U1", "U2"]}
+
+
+def test_overtime_only_for_fulltime_17(tmp_path):
+    users = [("U1", 35.03, 135.0, 1, 0, 1, 5)]
+    staff = [("S1", 5, 3), ("S2", 5, 3)]
+    _write(tmp_path, users, staff, [(DATE, "S1", "08:00", "17:00"), (DATE, "S2", "14:00", "17:00")],
+           [("C1", 4, 0, "")], [("P1", "13:00", "16:50")], [(DATE, "U1", "P1")])
+    cfg = RoutingConfig(assign_time_limit_sec=10)
+    day = load_day(tmp_path, DATE, cfg)
+    assert day.staff["S1"].overtime_max == 60      # 常勤（9時間）・17時終わり
+    assert day.staff["S2"].overtime_max == 0       # 短時間勤務
+    prov = _provider(day, cfg)
+    plan = plan_day(day, prov, cfg)
+    # 16:50 発の送りは 17:00 までに戻れないので、残業できる S1 が担当する
+    assert plan.dropped == {}
+    last = max(plan.planned, key=lambda p: p.start)
+    assert last.staff_id == "S1" and last.end > hm_to_min("17:00")
+    assert validate(day, plan.planned, prov, cfg) == []
+    # 残業なしの設定では乗せられない
+    cfg2 = RoutingConfig(assign_time_limit_sec=10, overtime_enabled=False)
+    day2 = load_day(tmp_path, DATE, cfg2)
+    plan2 = plan_day(day2, _provider(day2, cfg2), cfg2)
+    assert plan2.dropped == {"送り16:50": ["U1"]}

@@ -95,8 +95,8 @@ def validate(day: DayProblem, planned: list[PlannedRoute], provider: TravelTimeP
                 errs.append(f"{rid}: 送りと迎えの間の待機 {b - a} 分が範囲外")
 
         # 6. シフト
-        if not (s.start <= p.start and p.end <= s.end):
-            errs.append(f"{rid}: {s.staff_id} のシフト外")
+        if not (s.start <= p.start and p.end <= s.work_end):
+            errs.append(f"{rid}: {s.staff_id} のシフト外（残業の上限を含む）")
 
         busy["職員", s.staff_id].append((p.start, p.end, rid))
         busy["車", c.car_id].append((p.start, p.end, rid))

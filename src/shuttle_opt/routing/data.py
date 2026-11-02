@@ -56,6 +56,12 @@ class Staff:
     home: tuple[float, float] | None = None   # 自宅の (緯度, 経度)
     direct_start: bool = False   # 直行: 朝は自宅から迎えに出る
     direct_end: bool = False     # 直帰: 夕方は送りの後そのまま自宅へ帰る
+    overtime_max: int = 0        # 残業してよい最大分数（常勤で定時に終わる人のみ）
+
+    @property
+    def work_end(self) -> int:
+        """残業を含めて働ける最終時刻."""
+        return self.end + self.overtime_max
 
 
 @dataclass
@@ -65,6 +71,7 @@ class Car:
     walker_slots: int
     owner: str | None   # 職員所有車なら staff_id
     wheelchair_slots: int = 0
+    help: bool = False  # ヘルプ車（足りないときだけ使う）
 
 
 @dataclass
@@ -76,7 +83,8 @@ class User:
     walker: int
     seats: int
     service_min: int
-    plan_id: str
+    arrive: int           # 当日の施設到着時刻（分）
+    depart: int           # 当日の施設出発時刻（分）
     wheelchair: int = 0   # 車椅子のまま乗車する（車椅子枠が必要）
 
 
@@ -86,7 +94,6 @@ class Wave:
     wave_id: str
     kind: str           # "pickup"（迎え） / "dropoff"（送り）
     time: int           # 迎え: 施設到着時刻, 送り: 施設出発時刻
-    plan_id: str
     user_ids: list[str] = field(default_factory=list)
 
 
@@ -139,28 +146,37 @@ def list_dates(data_dir: str | Path) -> list[str]:
     return sorted({norm_date(d) for d in df["date"].dropna()})
 
 
-def load_day(data_dir: str | Path, date: str) -> DayProblem:
+def load_day(data_dir: str | Path, date: str, cfg=None) -> DayProblem:
+    """cfg: RoutingConfig（残業の設定に使う。省略時は既定値）."""
+    from .config import RoutingConfig
+    cfg = cfg or RoutingConfig()
     d = Path(data_dir)
     fac = pd.read_csv(d / "facility.csv").iloc[0]
     df_staff = pd.read_csv(d / "staff.csv", dtype={"staff_id": str})
     df_shift = pd.read_csv(d / "shifts.csv", dtype=str)
     df_cars = pd.read_csv(d / "cars.csv", dtype={"car_id": str, "owner_staff_id": str})
     df_users = pd.read_csv(d / "users.csv", dtype={"user_id": str})
-    df_plans = pd.read_csv(d / "plans.csv", dtype=str)
     df_att = pd.read_csv(d / "attendance.csv", dtype=str)
 
     date = norm_date(date)
-    for df in (df_staff, df_shift, df_cars, df_users, df_plans, df_att):
+    for df in (df_staff, df_shift, df_cars, df_users, df_att):
         df.columns = [c.strip() for c in df.columns]
     df_shift["date"] = df_shift["date"].map(norm_date)
     df_att["date"] = df_att["date"].map(norm_date)
-    for df, cols in ((df_shift, ["staff_id"]), (df_att, ["user_id", "plan_id"]),
-                     (df_plans, ["plan_id"]), (df_staff, ["staff_id"]), (df_users, ["user_id"])):
+    for df, cols in ((df_shift, ["staff_id"]), (df_att, ["user_id"]),
+                     (df_staff, ["staff_id"]), (df_users, ["user_id"])):
         for c in cols:
             df[c] = df[c].astype(str).str.strip()
-    unknown = set(df_att["plan_id"]) - set(df_plans["plan_id"])
-    if unknown:
-        raise ValueError(f"attendance.csv に plans.csv にないプランID: {sorted(unknown)}")
+    if not {"arrive", "depart"} <= set(df_att.columns):
+        # 旧形式（plan_id + plans.csv）にも対応
+        df_plans = pd.read_csv(d / "plans.csv", dtype=str)
+        df_plans.columns = [c.strip() for c in df_plans.columns]
+        df_plans["plan_id"] = df_plans["plan_id"].astype(str).str.strip()
+        df_att["plan_id"] = df_att["plan_id"].astype(str).str.strip()
+        unknown = set(df_att["plan_id"]) - set(df_plans["plan_id"])
+        if unknown:
+            raise ValueError(f"attendance.csv に plans.csv にないプランID: {sorted(unknown)}")
+        df_att = df_att.merge(df_plans[["plan_id", "arrive", "depart"]], on="plan_id", how="left")
     if df_users["user_id"].duplicated().any():
         raise ValueError(f"users.csv に重複した user_id: {sorted(df_users[df_users['user_id'].duplicated()]['user_id'].unique())}")
 
@@ -175,8 +191,13 @@ def load_day(data_dir: str | Path, date: str) -> DayProblem:
         ds, de = bool(_int(getattr(r, "direct_start", 0))), bool(_int(getattr(r, "direct_end", 0)))
         if (ds or de) and home is None:
             raise ValueError(f"staff.csv: {r.staff_id} は直行/直帰ですが自宅座標（home_lat, home_lng）がありません")
+        start, end = hm_to_min(sh["start"]), hm_to_min(sh["end"])
+        # 常勤（fulltime=1。列がなければ勤務7時間以上を常勤とみなす）で定時に終わる人は残業可
+        ft = getattr(r, "fulltime", None)
+        fulltime = bool(_int(ft)) if _float(ft) is not None else (end - start >= 7 * 60)
+        ot = cfg.overtime_max if (cfg.overtime_enabled and fulltime and end == hm_to_min(cfg.overtime_shift_end)) else 0
         staff[r.staff_id] = Staff(r.staff_id, int(r.priority), int(r.care_skill),
-                                  hm_to_min(sh["start"]), hm_to_min(sh["end"]), home, ds, de)
+                                  start, end, home, ds, de, ot)
 
     cars = {}
     for r in df_cars.itertuples(index=False):
@@ -184,29 +205,35 @@ def load_day(data_dir: str | Path, date: str) -> DayProblem:
         if owner and owner not in staff:
             continue   # 持ち主が休みの日は、その車は使えない
         cars[r.car_id] = Car(r.car_id, int(r.capacity), _int(r.walker_slots), owner,
-                             _int(getattr(r, "wheelchair_slots", 0)))
+                             _int(getattr(r, "wheelchair_slots", 0)), bool(_int(getattr(r, "help", 0))))
 
     att = df_att[df_att["date"] == date]
     if att.empty:
         raise ValueError(f"{date} の利用者がいません（attendance.csv）")
-    plan_of = dict(zip(att["user_id"], att["plan_id"]))
+    times = {}
+    for r in att.itertuples(index=False):
+        if pd.isna(r.arrive) or pd.isna(r.depart):
+            raise ValueError(f"attendance.csv: {date} {r.user_id} の到着時刻・出発時刻がありません")
+        times[r.user_id] = (hm_to_min(r.arrive), hm_to_min(r.depart))
     users = {}
     for r in df_users.itertuples(index=False):
-        if r.user_id in plan_of:
+        if r.user_id in times:
+            a, dep = times[r.user_id]
             users[r.user_id] = User(r.user_id, float(r.lat), float(r.lng), _int(r.care_need, 1),
                                     _int(r.walker), _int(r.seats, 1), _int(r.service_min, 5),
-                                    plan_of[r.user_id], _int(getattr(r, "wheelchair", 0)))
-    missing = set(plan_of) - set(users)
+                                    a, dep, _int(getattr(r, "wheelchair", 0)))
+    missing = set(times) - set(users)
     if missing:
         raise ValueError(f"users.csv に存在しない利用者ID: {sorted(missing)}")
 
+    # 便 = 到着時刻ごとの迎え便 ＋ 出発時刻ごとの送り便（同じ時刻の人は1つの便にまとめる）
     waves = []
-    for p in df_plans.itertuples(index=False):
-        uids = sorted(u for u, pid in plan_of.items() if pid == p.plan_id)
-        if not uids:
-            continue
-        waves.append(Wave(f"迎え{p.arrive}_{p.plan_id}", "pickup", hm_to_min(p.arrive), p.plan_id, uids))
-        waves.append(Wave(f"送り{p.depart}_{p.plan_id}", "dropoff", hm_to_min(p.depart), p.plan_id, uids))
+    for t in sorted({u.arrive for u in users.values()}):
+        uids = sorted(u.user_id for u in users.values() if u.arrive == t)
+        waves.append(Wave(f"迎え{min_to_hm(t)}", "pickup", t, uids))
+    for t in sorted({u.depart for u in users.values()}):
+        uids = sorted(u.user_id for u in users.values() if u.depart == t)
+        waves.append(Wave(f"送り{min_to_hm(t)}", "dropoff", t, uids))
     waves.sort(key=lambda w: w.time)
 
     ng: set[frozenset[str]] = set()

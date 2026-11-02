@@ -4,7 +4,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
-from .assign import compatible_cars, compatible_staff, select_and_assign
+from .assign import AssignResult, compatible_cars, compatible_staff, select_and_assign
+from .heuristic import dropped_of, greedy_plan
 from .config import RoutingConfig
 from .data import DayProblem, min_to_hm
 from .route_gen import PlannedRoute, generate_pool
@@ -35,24 +36,57 @@ def plan_day(day: DayProblem, provider: TravelTimeProvider, cfg: RoutingConfig |
     log.append(f"Stage A: 候補ルート {len(pool.routes)} 本（{t1 - t0:.1f} 秒）")
     for wid, us in pool.uncoverable.items():
         log.append(f"  [警告] {wid}: 条件に合う職員・車がいない利用者 {', '.join(us)}")
-    res = select_and_assign(day, pool, cfg)
+    has_help = any(c.help for c in day.cars.values())
+    res = _solve(day, pool, cfg, use_help=not has_help, log=log)
+    if has_help:
+        n_drop = sum(len(v) for v in res.dropped.values())
+        log.append(f"Stage B-1（ヘルプ車なし）: {res.status} / 乗せられない {n_drop} 件")
+        if n_drop:
+            # 通常の車だけでは乗せきれない → ヘルプ車も使ってよい条件で、いまの解を初期解にして解き直す
+            res2 = _solve(day, pool, cfg, use_help=True, log=log, hint=res.planned)
+            n2 = sum(len(v) for v in res2.dropped.values())
+            log.append(f"Stage B-2（ヘルプ車あり）: {res2.status} / 乗せられない {n2} 件")
+            if n2 < n_drop:
+                res = res2
     n_chain = sum(r.is_chain for r in pool.routes)
     if n_chain:
         log.append(f"  連結ルート（送り→施設に戻らず迎え）: 候補 {n_chain} 本 / 採用 "
                    f"{sum(p.route.is_chain for p in res.planned)} 本")
     t2 = time.perf_counter()
     gap = ""
-    if res.ok and res.status != "OPTIMAL" and res.bound is not None:
+    if res.status == "FEASIBLE" and res.bound is not None and res.bound > 0:
         gap = f" / 下界 {res.bound:.0f} に対し目的値 {res.objective:.0f}"
     log.append(f"Stage B: {res.status} / 採用 {len(res.planned)} 本（{t2 - t1:.1f} 秒）{gap}")
     if res.ok:
         for wid, us in res.dropped.items():
             for u in us:
                 log.append(f"  [警告] {wid}: {u} を乗せられません（{_reason(day, pool, wid, u)}）")
+    if res.ok:
+        helps = sorted({p.car_id for p in res.planned if day.cars[p.car_id].help})
+        if helps:
+            log.append(f"  ヘルプ車を使用: {', '.join(helps)}（通常の車だけでは乗せきれないため）")
     plan = DayPlan(res.ok, res.status, res.planned, res.dropped, log)
     if res.ok:
         plan.breaks = lunch.breaks(day, res.planned, cfg)
     return plan
+
+
+def _score(day: DayProblem, planned: list[PlannedRoute]) -> tuple[int, int]:
+    """(乗せられない件数, 走行時間) 小さいほど良い."""
+    return sum(len(v) for v in dropped_of(day, planned).values()), sum(p.route.travel for p in planned)
+
+
+def _solve(day: DayProblem, pool, cfg: RoutingConfig, use_help: bool, log: list[str],
+           hint: list[PlannedRoute] | None = None) -> AssignResult:
+    """貪欲法の初期解 → CP-SAT で改善。CP-SAT が悪化・失敗したら初期解を使う."""
+    g = greedy_plan(day, pool, cfg, use_help=use_help)
+    if hint is not None and _score(day, hint) < _score(day, g):
+        g = hint
+    log.append(f"  初期解（貪欲法）: 乗せられない {_score(day, g)[0]} 件")
+    res = select_and_assign(day, pool, cfg, hint=g, use_help=use_help)
+    if not res.ok or _score(day, res.planned) > _score(day, g):
+        return AssignResult("初期解を採用（CP-SAT: " + res.status + "）", g, dropped_of(day, g))
+    return res
 
 
 def _reason(day: DayProblem, pool, wave_id: str, uid: str) -> str:
@@ -82,6 +116,16 @@ def _reason(day: DayProblem, pool, wave_id: str, uid: str) -> str:
     return "職員・車の空き時間が足りない（同じ時間帯の便と重なる）"
 
 
+def overtime(day: DayProblem, plan: DayPlan) -> dict[str, int]:
+    """職員ごとの残業分数（定時を過ぎて施設・自宅に着いた分）."""
+    out: dict[str, int] = {}
+    for p in plan.planned:
+        ot = p.end - day.staff[p.staff_id].end
+        if ot > 0:
+            out[p.staff_id] = max(out.get(p.staff_id, 0), ot)
+    return out
+
+
 def describe(day: DayProblem, plan: DayPlan) -> str:
     """職員ごとのタイムライン（テキスト）."""
     lines = []
@@ -91,6 +135,8 @@ def describe(day: DayProblem, plan: DayPlan) -> str:
         direct = "・直行" * s.direct_start + "・直帰" * s.direct_end
         br = plan.breaks.get(sid)
         lunch_txt = f" ／ 昼休み {min_to_hm(br[0])}-{min_to_hm(br[1])}" if br else ""
+        ot = overtime(day, plan).get(sid, 0)
+        lunch_txt += f" ／ 残業 {ot}分" if ot else ""
         lines.append(f"■ {sid}（優先度{s.priority}・介助{s.care_skill}{direct}・勤務 {min_to_hm(s.start)}-{min_to_hm(s.end)}）"
                      f" 担当 {len(ps)} 本{lunch_txt}")
         for p in ps:
@@ -105,6 +151,7 @@ def describe(day: DayProblem, plan: DayPlan) -> str:
                 label = f"{r.wave_id}→{r.wave2}"
             else:
                 route_txt, label = " → ".join(parts), r.wave_id
-            lines.append(f"   {min_to_hm(p.start)}-{min_to_hm(p.end)} {p.car_id} {label}: "
+            car = f"{p.car_id}(ヘルプ)" if day.cars[p.car_id].help else p.car_id
+            lines.append(f"   {min_to_hm(p.start)}-{min_to_hm(p.end)} {car} {label}: "
                          f"{sp} → {route_txt} → {ep}")
     return "\n".join(lines)

@@ -12,7 +12,7 @@
 ハード制約
     - 各便の各利用者は、採用ルートのうちちょうど1本に乗る（不可能な場合のみ大ペナルティで除外）
     - 同じ職員 / 同じ車は時間が重ならない（準備時間 turnaround を含む）
-    - 職員のシフト内に収まる
+    - 職員のシフト内に収まる（常勤で定時17:00の人は最大60分の残業可。残業は1分ごとにペナルティ）
     - 職員の介助スキル ≥ ルート内の最大介助レベル、車の定員・歩行器枠 ≥ ルートの人数・歩行器数
     - 職員所有車は持ち主のみ / 所有者は自車のみ（w[r,o,持ち主] == v[r,o,所有車]）
     - 同乗NGの利用者は同じルートに入れない（候補ルートの段階で除外）
@@ -20,6 +20,8 @@
       （自宅発ルートは必ずその日最初のルート）
     - 直帰する職員: その日最後のルートが送りなら、自宅着のルートでなければならない
       （自宅着ルートは必ずその日最後のルート）
+    - ヘルプ車（cars.csv の help=1）は、使うと1台ごとに大きなペナルティ。
+      乗せられない人を減らせるときだけ使われる（走行時間の短縮だけでは使わない）
     - 昼休み: 11:30〜13:30 の間に連続30分以上、送迎しない時間を必ず作る（lunch.py）。
       連結ルート（送り→迎え）の空車待機中に取ってもよい
     - 連結ルート: 送りで全員降ろしたら施設に戻らず次の迎えへ（候補は route_gen.build_chains）
@@ -52,7 +54,7 @@ class AssignResult:
 
     @property
     def ok(self) -> bool:
-        return self.status in ("OPTIMAL", "FEASIBLE")
+        return self.status in ("OPTIMAL", "FEASIBLE") or self.status.startswith("初期解")
 
 
 def start_options(r: Route, step: int) -> list[int]:
@@ -71,7 +73,7 @@ def start_options(r: Route, step: int) -> list[int]:
 def compatible_staff(day: DayProblem, r: Route, start: int) -> list[str]:
     return [s.staff_id for s in day.staff.values()
             if (r.staff_only is None or r.staff_only == s.staff_id)
-            and s.care_skill >= r.max_need and s.start <= start and r.end_at(start) <= s.end]
+            and s.care_skill >= r.max_need and s.start <= start and r.end_at(start) <= s.work_end]
 
 
 def compatible_cars(day: DayProblem, r: Route) -> list[str]:
@@ -94,13 +96,14 @@ def _add_no_overlap(m: cp_model.CpModel, items: list[tuple[int, int, cp_model.In
 
 
 def _add_direct_rules(m: cp_model.CpModel, day: DayProblem,
-                      staff_opts: dict[str, list[tuple[Route, int, cp_model.IntVar]]]) -> None:
+                      staff_opts: dict[str, list[tuple[Route, int, cp_model.IntVar]]]) -> dict:
     """直行・直帰の職員について「最初／最後のルート」の決まりを入れる.
 
     first[x] = 選択肢 x がその職員のその日最初のルート（last も同様）。
     最初のルートの出発時刻 E は、担当する全ルートの出発時刻以下になるようにする。
     """
     BIG = 24 * 60 * 2
+    aux: dict[str, tuple] = {}   # sid -> (has_any, first変数, last変数)  初期解のヒント用
     for sid, opts in staff_opts.items():
         st = day.staff[sid]
         if not (st.direct_start or st.direct_end) or not opts:
@@ -108,6 +111,7 @@ def _add_direct_rules(m: cp_model.CpModel, day: DayProblem,
         xs = [x for _, _, x in opts]
         has_any = m.new_bool_var(f"has_any[{sid}]")
         m.add_max_equality(has_any, xs)
+        f = l = None
         if st.direct_start:
             f = [m.new_bool_var(f"first[{sid},{i}]") for i in range(len(opts))]
             m.add(sum(f) == has_any)
@@ -130,11 +134,15 @@ def _add_direct_rules(m: cp_model.CpModel, day: DayProblem,
                     m.add(li == 0)        # 施設着の送りは、その日最後のルートにできない
                 if r.end_pt != "DEPOT":
                     m.add(x <= li)        # 自宅着ルートは必ず最後
+        aux[sid] = (has_any, f, l)
+    return aux
 
 
 def select_and_assign(day: DayProblem, pool: Pool, cfg: RoutingConfig,
-                      hint: list[PlannedRoute] | None = None, time_limit: float | None = None) -> AssignResult:
-    """hint: 先に解いた計画（あれば初期解として渡し、そこから改善させる）."""
+                      hint: list[PlannedRoute] | None = None, time_limit: float | None = None,
+                      use_help: bool = True) -> AssignResult:
+    """hint: 先に解いた計画（あれば初期解として渡し、そこから改善させる）.
+    use_help: False ならヘルプ車を使わない."""
     m = cp_model.CpModel()
     owner_of = {c.car_id: c.owner for c in day.cars.values() if c.owner}
 
@@ -149,7 +157,7 @@ def select_and_assign(day: DayProblem, pool: Pool, cfg: RoutingConfig,
 
     for r in pool.routes:
         rid = r.route_id
-        cars_ok = compatible_cars(day, r)
+        cars_ok = [c for c in compatible_cars(day, r) if use_help or not day.cars[c].help]
         if not cars_ok:
             continue
         for o in start_options(r, cfg.start_step):
@@ -166,6 +174,9 @@ def select_and_assign(day: DayProblem, pool: Pool, cfg: RoutingConfig,
             for sid in staff_ok:
                 x = m.new_bool_var(f"w[{rid},{o},{sid}]")
                 w[rid, o, sid] = x
+                ot = r.end_at(o) - day.staff[sid].end
+                if ot > 0:   # 残業（常勤の定時以降）
+                    cost_terms.append(cfg.w_overtime * ot * x)
                 by_staff[sid].append((o, end, x))
                 staff_opts[sid].append((r, o, x))
             for cid in cars_used:
@@ -198,6 +209,7 @@ def select_and_assign(day: DayProblem, pool: Pool, cfg: RoutingConfig,
     # 昼休み: 対象の職員ごとに 30分の休憩枠を1つ選ぶ。休憩枠は、その職員が担当するルートの
     # 「手の離せない時間」（出発〜帰着後の準備。連結ルートの空車待機は除く）と重ならないこと。
     # → 連結ルートの途中、利用者を乗せていない待機時間に昼休みを取ってもよい。
+    lunch_vars: dict[tuple[str, int], cp_model.IntVar] = {}
     for sid, st in day.staff.items():
         if not lunch.applies(st, cfg):
             continue
@@ -205,6 +217,7 @@ def select_and_assign(day: DayProblem, pool: Pool, cfg: RoutingConfig,
         items, brs = [], []
         for b in lunch.break_starts(cfg):
             br = m.new_bool_var(f"lunch[{sid},{b}]")
+            lunch_vars[sid, b] = br
             brs.append(br)
             items.append((b, b + cfg.lunch_min, br))
         for r, o, x in staff_opts.get(sid, []):
@@ -218,7 +231,15 @@ def select_and_assign(day: DayProblem, pool: Pool, cfg: RoutingConfig,
         _add_no_overlap(m, items)
     for items in by_car.values():
         _add_no_overlap(m, items)
-    _add_direct_rules(m, day, staff_opts)
+    direct_aux = _add_direct_rules(m, day, staff_opts)
+
+    # ヘルプ車: 1本でも使えば1台分のペナルティ（優先的には使わない）
+    help_used = {}
+    for cid, items in by_car.items():
+        if day.cars[cid].help and items:
+            u = m.new_bool_var(f"help_used[{cid}]")
+            m.add_max_equality(u, [y for _, _, y in items])
+            help_used[cid] = u
 
     p_max = max(s.priority for s in day.staff.values())
     max_load = m.new_int_var(0, 50, "max_load")
@@ -229,6 +250,7 @@ def select_and_assign(day: DayProblem, pool: Pool, cfg: RoutingConfig,
         + cfg.w_priority * sum((p_max - day.staff[s].priority) * x for (rid, o, s), x in w.items())
         + cfg.w_max_load * max_load
         + cfg.drop_penalty * sum(missed.values())
+        + cfg.w_help_car * sum(help_used.values())
     )
 
     if hint is not None:
@@ -244,10 +266,43 @@ def select_and_assign(day: DayProblem, pool: Pool, cfg: RoutingConfig,
         covered = {(wid, u) for p in hint for wid, uids in p.route.segments() for u in uids}
         for key, miss in missed.items():
             m.add_hint(miss, key not in covered)
+        for cid, u in help_used.items():
+            m.add_hint(u, any(p.car_id == cid for p in hint))
+        # 直行・直帰の補助変数
+        for sid, (has_any, f, l) in direct_aux.items():
+            mine = sorted((p for p in hint if p.staff_id == sid), key=lambda p: p.start)
+            m.add_hint(has_any, bool(mine))
+            keys = [(r.route_id, o) for r, o, _ in staff_opts[sid]]
+            first = (mine[0].route.route_id, mine[0].start) if mine else None
+            last = (mine[-1].route.route_id, mine[-1].start) if mine else None
+            if f is not None:
+                for k, fi in zip(keys, f):
+                    m.add_hint(fi, k == first)
+            if l is not None:
+                for k, li in zip(keys, l):
+                    m.add_hint(li, k == last)
+        counts = defaultdict(int)
+        for p in hint:
+            counts[p.staff_id] += 1
+        m.add_hint(max_load, max(counts.values(), default=0))
+        # 昼休み: 初期解の空き時間に入る最初の休憩枠
+        for sid, st in day.staff.items():
+            if not lunch.applies(st, cfg):
+                continue
+            free = lunch.find_break(st, hint, cfg)
+            pick = None
+            if free:
+                pick = next((b for b in lunch.break_starts(cfg)
+                             if free[0] <= b and b + cfg.lunch_min <= free[0] + (free[1] - free[0])
+                             and (sid, b) in lunch_vars), None)
+            for (s2, b), br in lunch_vars.items():
+                if s2 == sid:
+                    m.add_hint(br, b == pick)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = time_limit or cfg.assign_time_limit_sec
     solver.parameters.num_workers = cfg.num_workers
+
     st = solver.solve(m)
     res = AssignResult(solver.status_name(st))
     if not res.ok:

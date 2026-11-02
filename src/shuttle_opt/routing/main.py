@@ -27,7 +27,7 @@ import pandas as pd
 from .config import RoutingConfig
 from .data import list_dates, load_day, min_to_hm, norm_date
 from .maps import route_url
-from .pipeline import describe, plan_day
+from .pipeline import describe, overtime, plan_day
 from .travel_time import DEPOT, CachedMatrixProvider, HaversineProvider
 from .validate import validate
 
@@ -56,7 +56,7 @@ def _place(pt: str) -> str:
 
 def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
     """1日分を計画して出力する. 戻り値は summary.csv の1行."""
-    day = load_day(args.data, date)
+    day = load_day(args.data, date, cfg)
     points = day.points()
     provider = HaversineProvider(points, cfg.detour, cfg.speed_kmh)
     matrix = args.matrix
@@ -68,12 +68,17 @@ def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
     else:
         print(f"移動時間: 直線距離 × {cfg.detour} ÷ 時速{cfg.speed_kmh:g}km で推計")
 
-    print(f"対象日 {day.date}: 職員 {len(day.staff)} 名 / 使える車 {len(day.cars)} 台 / "
+    n_help = sum(c.help for c in day.cars.values())
+    print(f"対象日 {day.date}: 職員 {len(day.staff)} 名 / 使える車 {len(day.cars)} 台"
+          f"{f'（うちヘルプ車 {n_help} 台）' if n_help else ''} / "
           f"利用者 {len(day.users)} 名 / 便 {len(day.waves)}")
     direct = [f"{s.staff_id}({'直行' * s.direct_start}{'・' * (s.direct_start and s.direct_end)}{'直帰' * s.direct_end})"
               for s in day.staff.values() if s.direct_start or s.direct_end]
     if direct:
         print(f"直行・直帰する職員: {', '.join(direct)}")
+    ot_staff = [s.staff_id for s in day.staff.values() if s.overtime_max]
+    if ot_staff:
+        print(f"残業可（最大{cfg.overtime_max}分）: {', '.join(ot_staff)}")
     ng_today = [" と ".join(sorted(p)) for p in day.ng_pairs if p <= set(day.users)]
     if ng_today:
         print(f"同乗NG（当日該当）: {' / '.join(ng_today)}")
@@ -81,7 +86,9 @@ def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
     print("\n".join(plan.log))
     summary = {"日付": day.date, "職員": len(day.staff), "車": len(day.cars), "利用者": len(day.users),
                "状態": plan.status, "ルート数": len(plan.planned), "総走行分": plan.total_travel,
-               "乗せられない件数": sum(len(v) for v in plan.dropped.values()), "検証": ""}
+               "乗せられない件数": sum(len(v) for v in plan.dropped.values()),
+               "ヘルプ車": " ".join(sorted({p.car_id for p in plan.planned if day.cars[p.car_id].help})),
+               "残業": " ".join(f"{k}:{v}分" for k, v in sorted(overtime(day, plan).items())), "検証": ""}
     if not plan.ok:
         print("\n[ERROR] 計画が見つかりませんでした。")
         summary["検証"] = "計画なし"
@@ -103,6 +110,7 @@ def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
         label = f"{r.wave_id}→{r.wave2}" if r.is_chain else r.wave_id
         idle = p.idle
         rows.append({"route_id": r.route_id, "便": label, "職員": p.staff_id, "車": p.car_id,
+                     "ヘルプ車": "○" if day.cars[p.car_id].help else "",
                      "出発地": _place(r.start_pt), "出発時刻": min_to_hm(p.start),
                      "到着地": _place(r.end_pt), "到着時刻": min_to_hm(p.end),
                      "人数": r.seats, "歩行器": r.walkers, "車椅子": r.wheelchairs, "最大介助": r.max_need,

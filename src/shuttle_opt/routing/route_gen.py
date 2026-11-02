@@ -232,7 +232,7 @@ def generate_pool(day: DayProblem, provider: TravelTimeProvider, cfg: RoutingCon
     cars = sorted(day.cars.values(),
                   key=lambda c: (-c.capacity, -c.wheelchair_slots, -c.walker_slots, c.car_id))
     for w in day.waves:
-        avail = [s for s in day.staff.values() if staff_available(w.kind, w.time, s.start, s.end)]
+        avail = [s for s in day.staff.values() if staff_available(w.kind, w.time, s.start, s.work_end)]
         if not avail or not cars:
             pool.uncoverable[w.wave_id] = list(w.user_ids)
             continue
@@ -307,7 +307,7 @@ def generate_pool(day: DayProblem, provider: TravelTimeProvider, cfg: RoutingCon
             v = min(cands, key=lambda x: x.duration)
             if v.start_lo > v.start_hi:
                 continue
-            if max(v.start_lo, st.start) > min(v.start_hi, st.end - v.duration):
+            if max(v.start_lo, st.start) > min(v.start_hi, st.work_end - v.duration):
                 continue   # 勤務時間に収まらない
             v.staff_only = st.staff_id
             variants.append(v)
@@ -336,7 +336,8 @@ def build_chains(day: DayProblem, routes: list[Route], provider: TravelTimeProvi
     """送り→迎えの連結ルート候補を作る.
 
     送りルートで全員降ろしたあと施設に戻らず、そのまま後の便の迎えルートに向かう。
-    施設に戻って出直すより移動が短くなる組だけを、送りルート1本につき chain_per_route 本まで作る。
+    施設に戻って出直すより移動が短くなる組（短くならなくても、時間的に次の迎えに間に合うようになる組を含む）を、
+    送りルート1本につき chain_per_route 本まで、短くなる順に作る。
     """
     waves = {w.wave_id: w for w in day.waves}
     drops = [r for r in routes if r.kind == "dropoff" and r.start_pt == DEPOT and r.end_pt == DEPOT]
@@ -356,8 +357,8 @@ def build_chains(day: DayProblem, routes: list[Route], provider: TravelTimeProvi
             fwd = provider.minutes(DEPOT, first)
             dead = provider.minutes(last, first)
             saving = back + fwd - dead
-            if saving <= 0:
-                continue
+            if saving < cfg.chain_min_saving:
+                continue   # 施設に戻って出直すより大幅に遠回り
             tail = p.duration - fwd          # 迎えの1人目の家に着いてから施設に着くまで
             # 出発時刻 o: 送りの時間窓 [lo, hi] かつ 待機 W = A - tail - (o + d_body + dead) が 0〜上限
             latest = wp.time - tail - d_body - dead
