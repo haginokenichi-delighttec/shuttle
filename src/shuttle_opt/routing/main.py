@@ -8,7 +8,8 @@
 
 出力（--out 配下）
     routes_<date>.csv     ルート単位（職員・車・便・出発地/時刻・到着地/時刻・人数・順路・GoogleマップURL・確認用URL）
-    stops_<date>.csv      停車地単位（訪問順・到着予定時刻）
+    stops_<date>.csv      停車地単位（訪問順・到着予定・出発予定）
+    view_<date>.json      送迎表ビューア（viewer/送迎表.html）用の当日条件と移動時間表
     timeline_<date>.txt   職員ごとのタイムライン（昼休みを含む）
     breaks_<date>.csv     昼休み（職員・開始・終了・分）
     summary.csv           日ごとの結果一覧（複数日を計画したとき）
@@ -30,6 +31,7 @@ from .maps import route_url
 from .pipeline import describe, overtime, plan_day
 from .travel_time import DEPOT, CachedMatrixProvider, HaversineProvider
 from .validate import validate
+from .view_export import export_view
 
 
 class _Tee:
@@ -68,6 +70,9 @@ def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
     else:
         print(f"移動時間: 直線距離 × {cfg.detour} ÷ 時速{cfg.speed_kmh:g}km で推計")
 
+    out.mkdir(parents=True, exist_ok=True)
+    export_view(day, provider, cfg, out)   # 送迎表ビューア用（計画できなくても出力して手で組めるようにする）
+
     n_help = sum(c.help for c in day.cars.values())
     print(f"対象日 {day.date}: 職員 {len(day.staff)} 名 / 使える車 {len(day.cars)} 台"
           f"{f'（うちヘルプ車 {n_help} 台）' if n_help else ''} / "
@@ -78,7 +83,7 @@ def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
         print(f"直行・直帰する職員: {', '.join(direct)}")
     ot_staff = [s.staff_id for s in day.staff.values() if s.overtime_max]
     if ot_staff:
-        print(f"残業可（最大{cfg.overtime_max}分）: {', '.join(ot_staff)}")
+        print(f"残業可（{cfg.overtime_shift_end} 終業の常勤・最大 {cfg.overtime_max} 分）: {', '.join(ot_staff)}")
     ng_today = [" と ".join(sorted(p)) for p in day.ng_pairs if p <= set(day.users)]
     if ng_today:
         print(f"同乗NG（当日該当）: {' / '.join(ng_today)}")
@@ -88,6 +93,7 @@ def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
                "状態": plan.status, "ルート数": len(plan.planned), "総走行分": plan.total_travel,
                "乗せられない件数": sum(len(v) for v in plan.dropped.values()),
                "ヘルプ車": " ".join(sorted({p.car_id for p in plan.planned if day.cars[p.car_id].help})),
+               "残業合計分": sum(overtime(day, plan).values()),
                "残業": " ".join(f"{k}:{v}分" for k, v in sorted(overtime(day, plan).items())), "検証": ""}
     if not plan.ok:
         print("\n[ERROR] 計画が見つかりませんでした。")
@@ -123,7 +129,8 @@ def run_day(date: str, args, cfg: RoutingConfig, out: Path) -> dict:
         seg_wave = {u: wid for wid, uids in r.segments() for u in uids}
         for i, (u, t) in enumerate(zip(r.stops, p.eta), start=1):
             stops.append({"route_id": r.route_id, "職員": p.staff_id, "車": p.car_id, "順番": i,
-                          "便": seg_wave[u], "利用者": u, "到着予定": min_to_hm(t)})
+                          "便": seg_wave[u], "利用者": u, "到着予定": min_to_hm(t),
+                          "出発予定": min_to_hm(t + day.users[u].service_min)})
     pd.DataFrame(rows).to_csv(out / f"routes_{day.date}.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(stops).to_csv(out / f"stops_{day.date}.csv", index=False, encoding="utf-8-sig")
     text = describe(day, plan)
@@ -149,6 +156,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-matrix", action="store_true", help="移動時間の表を使わず直線距離で推計する")
     ap.add_argument("--early", type=int, default=None, help="迎えの早着許容（分）")
     ap.add_argument("--late", type=int, default=None, help="送りの出発遅れ許容（分）")
+    ap.add_argument("--overtime", type=int, default=None, help="常勤職員の残業上限（分）。0 で残業なし")
     ap.add_argument("--time-limit", type=int, default=None, help="Stage B の計算時間上限（秒）")
     args = ap.parse_args(argv)
 
@@ -159,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
         cfg.late_eps = args.late
     if args.time_limit is not None:
         cfg.assign_time_limit_sec = args.time_limit
+    if args.overtime is not None:
+        cfg.overtime_max = args.overtime
 
     out = Path(args.out)
     log_dir = out / "logs"

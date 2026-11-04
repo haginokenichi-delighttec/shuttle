@@ -9,7 +9,9 @@
 """
 from __future__ import annotations
 
+import heapq
 import math
+from itertools import combinations, permutations
 from dataclasses import dataclass, field
 
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
@@ -51,6 +53,10 @@ class Route:
     tail_len: int = 0               # 迎えの1人目の家に着いてから施設に着くまでの分数
     tail_offsets: list[int] = field(default_factory=list)   # 迎え側各宅への到着（fixed_end からの差、負）
     deadhead: int = 0               # 最後の送り先 → 最初の迎え先 の移動時間
+    # 早着型の連結ルート: 空車で待つ必要がなければそのまま回り、施設に arrive_lo〜fixed_end の間に着く。
+    # None なら定刻型（施設到着は fixed_end ちょうど）。
+    arrive_lo: int | None = None
+    drop_lo: int = 0                # 送り便の出発時刻（出発遅れの計算用）
 
     @property
     def is_chain(self) -> bool:
@@ -58,25 +64,31 @@ class Route:
 
     def end_at(self, start: int) -> int:
         """出発時刻 start のときの到着時刻."""
-        return self.fixed_end if self.is_chain else start + self.duration
+        if not self.is_chain:
+            return start + self.duration
+        if self.arrive_lo is None:
+            return self.fixed_end
+        # 待たずに回ったときの到着（早すぎるときは arrive_lo まで待つ）
+        return min(self.fixed_end, max(self.arrive_lo, start + self.idle_from + self.tail_len))
 
     def eta_at(self, start: int) -> list[int]:
         if not self.is_chain:
             return [start + o for o in self.offsets]
-        return [start + o for o in self.offsets] + [self.fixed_end + o for o in self.tail_offsets]
+        end = self.end_at(start)
+        return [start + o for o in self.offsets] + [end + o for o in self.tail_offsets]
 
     def idle_at(self, start: int) -> tuple[int, int] | None:
         """連結ルートの空車待機時間（開始, 終了）. 通常ルートは None."""
         if not self.is_chain:
             return None
-        return start + self.idle_from, self.fixed_end - self.tail_len
+        return start + self.idle_from, self.end_at(start) - self.tail_len
 
     def busy_parts(self, start: int, turnaround: int) -> list[tuple[int, int]]:
         """職員が手の離せない時間帯. 帰着後の準備時間を含む。連結ルートの空車待機は含まない."""
         if not self.is_chain:
             return [(start, start + self.duration + turnaround)]
         a, b = self.idle_at(start)
-        return [(start, a), (b, self.fixed_end + turnaround)]
+        return [(start, a), (b, self.end_at(start) + turnaround)]
 
     def segments(self) -> list[tuple[str, list[str]]]:
         """(便, 利用者) の組. 連結ルートは送りと迎えの2つ."""
@@ -112,10 +124,12 @@ class Pool:
     uncoverable: dict[str, list[str]] = field(default_factory=dict)   # wave_id -> 誰も乗せられない利用者
 
 
-def staff_available(kind: str, t: int, start: int, end: int) -> bool:
+def staff_available(kind: str, t: int, start: int, end: int, cfg: RoutingConfig | None = None) -> bool:
+    """その便を担当できる勤務時間か（目安. 厳密なシフト内チェックは Stage B で行う）."""
+    cfg = cfg or RoutingConfig()
     if kind == "pickup":
-        return start <= t - 10 and end >= t
-    return start <= t and end >= t + 15
+        return start <= t - cfg.staff_before_pickup and end >= t
+    return start <= t and end >= t + cfg.staff_after_dropoff
 
 
 def _make_route(day: DayProblem, w: Wave, stops: list[str], provider: TravelTimeProvider,
@@ -232,7 +246,7 @@ def generate_pool(day: DayProblem, provider: TravelTimeProvider, cfg: RoutingCon
     cars = sorted(day.cars.values(),
                   key=lambda c: (-c.capacity, -c.wheelchair_slots, -c.walker_slots, c.car_id))
     for w in day.waves:
-        avail = [s for s in day.staff.values() if staff_available(w.kind, w.time, s.start, s.work_end)]
+        avail = [s for s in day.staff.values() if staff_available(w.kind, w.time, s.start, s.work_end, cfg)]
         if not avail or not cars:
             pool.uncoverable[w.wave_id] = list(w.user_ids)
             continue
@@ -335,50 +349,127 @@ def build_chains(day: DayProblem, routes: list[Route], provider: TravelTimeProvi
                  cfg: RoutingConfig) -> list[Route]:
     """送り→迎えの連結ルート候補を作る.
 
-    送りルートで全員降ろしたあと施設に戻らず、そのまま後の便の迎えルートに向かう。
-    施設に戻って出直すより移動が短くなる組（短くならなくても、時間的に次の迎えに間に合うようになる組を含む）を、
-    送りルート1本につき chain_per_route 本まで、短くなる順に作る。
+    送りルートで全員降ろしたあと施設に戻らず、そのまま後の便の迎えに向かう。
+    迎え側は、(1) 施設発で作った迎えルートに加えて、(2) 送りの最後の家から出発する前提で
+    組み直した迎え（_pickups_from）も使う。
+    施設に戻って出直すより移動が短くなる組（短くならなくても chain_min_saving 分の遠回りまでで、
+    時間的に次の迎えに間に合うようになる組を含む）を、送りルート1本につき chain_per_route 組まで作る。
+    1組につき「定刻型（施設に到着時刻ちょうど）」と「早着型（待たずに回り、最大 early_eps 分早く着く）」の
+    2通りを候補にする。
     """
     waves = {w.wave_id: w for w in day.waves}
     drops = [r for r in routes if r.kind == "dropoff" and r.start_pt == DEPOT and r.end_pt == DEPOT]
-    picks = [r for r in routes if r.kind == "pickup" and r.start_pt == DEPOT and r.end_pt == DEPOT]
+    picks_by_wave: dict[str, list[Route]] = {}
+    for r in routes:
+        if r.kind == "pickup" and r.start_pt == DEPOT and r.end_pt == DEPOT:
+            picks_by_wave.setdefault(r.wave_id, []).append(r)
+    from_cache: dict[tuple[str, str], list[Route]] = {}
     out: list[Route] = []
     for d in drops:
         wd = waves[d.wave_id]
         last = d.stops[-1]
         back = provider.minutes(last, DEPOT)
         d_body = d.duration - back           # 施設を出て最後の人を降ろし終えるまで
-        cands = []
-        for p in picks:
-            wp = waves[p.wave_id]
-            if wp.time <= wd.time:
+        cands, seen_keys = [], set()
+        for wp in day.waves:
+            if wp.kind != "pickup" or wp.time <= wd.time:
                 continue
-            first = p.stops[0]
-            fwd = provider.minutes(DEPOT, first)
-            dead = provider.minutes(last, first)
-            saving = back + fwd - dead
-            if saving < cfg.chain_min_saving:
-                continue   # 施設に戻って出直すより大幅に遠回り
-            tail = p.duration - fwd          # 迎えの1人目の家に着いてから施設に着くまで
-            # 出発時刻 o: 送りの時間窓 [lo, hi] かつ 待機 W = A - tail - (o + d_body + dead) が 0〜上限
-            latest = wp.time - tail - d_body - dead
-            lo = max(d.start_lo, latest - cfg.chain_max_wait)
-            hi = min(d.start_hi, latest)
-            if lo > hi:
-                continue
-            cands.append((saving, p, dead, fwd, tail, lo, hi))
+            key = (last, wp.wave_id)
+            if key not in from_cache:
+                from_cache[key] = _pickups_from(day, last, wp, provider, cfg)
+            for p in picks_by_wave.get(wp.wave_id, []) + from_cache[key]:
+                k2 = (wp.wave_id, tuple(p.stops))
+                if k2 in seen_keys or not day.ng_ok(p.stops):
+                    continue
+                seen_keys.add(k2)
+                first = p.stops[0]
+                fwd = provider.minutes(DEPOT, first)
+                dead = provider.minutes(last, first)
+                saving = back + fwd - dead
+                if saving < cfg.chain_min_saving:
+                    continue   # 施設に戻って出直すより大幅に遠回り
+                tail = p.duration - fwd          # 迎えの1人目の家に着いてから施設に着くまで
+                drive = d_body + dead + tail     # 待たずに回ったときの 出発→施設到着
+                # 出発時刻 o の範囲: 送りの時間窓の中で、到着時刻に間に合い、空車待機が上限以内
+                hi = min(d.start_hi, wp.time - drive)
+                lo = max(d.start_lo, wp.time - cfg.early_eps - drive - cfg.chain_max_wait)
+                if lo > hi:
+                    continue
+                cands.append((saving, wp, p, dead, tail, drive, lo, hi))
+        # 便・人数ごとに最も良い組をまず選び、残りは短縮効果の大きい順
         cands.sort(key=lambda c: -c[0])
-        for saving, p, dead, fwd, tail, lo, hi in cands[:cfg.chain_per_route]:
-            stops = d.stops + p.stops
-            if not day.ng_ok(d.stops) or not day.ng_ok(p.stops):
-                continue
-            wp = waves[p.wave_id]
+        chosen, groups = [], set()
+        for c in cands:
+            g = (c[1].wave_id, len(c[2].stops))
+            if g not in groups and len(chosen) < cfg.chain_per_route:
+                groups.add(g)
+                chosen.append(c)
+        for c in cands:
+            if len(chosen) >= cfg.chain_per_route:
+                break
+            if c not in chosen:
+                chosen.append(c)
+        for saving, wp, p, dead, tail, drive, lo, hi in chosen:
             tail_offsets = [o - p.duration for o in p.offsets]   # 施設到着からの差（負）
-            out.append(Route(
-                "", d.wave_id, "chain", stops, list(d.offsets), wp.time - lo,
-                max(d.seats, p.seats), max(d.walkers, p.walkers), max(d.max_need, p.max_need),
-                d.travel - back + dead + p.travel - fwd, max(d.wheelchairs, p.wheelchairs),
-                lo, hi, DEPOT, DEPOT, None,
-                wave2=p.wave_id, n_first=len(d.stops), fixed_end=wp.time,
-                idle_from=d_body + dead, tail_len=tail, tail_offsets=tail_offsets, deadhead=dead))
+            on_time_lo = max(lo, wp.time - drive - cfg.chain_max_wait)   # 定刻型の出発時刻の下限
+            variants = []
+            if on_time_lo <= hi:
+                variants.append((None, on_time_lo))
+            if cfg.early_eps > 0:
+                variants.append((wp.time - cfg.early_eps, lo))
+            for arrive_lo, vlo in variants:
+                out.append(Route(
+                    "", d.wave_id, "chain", d.stops + p.stops, list(d.offsets), wp.time - vlo,
+                    max(d.seats, p.seats), max(d.walkers, p.walkers), max(d.max_need, p.max_need),
+                    d.travel - provider.minutes(d.stops[-1], DEPOT) + dead + p.travel - provider.minutes(DEPOT, p.stops[0]),
+                    max(d.wheelchairs, p.wheelchairs),
+                    vlo, hi, DEPOT, DEPOT, None,
+                    wave2=wp.wave_id, n_first=len(d.stops), fixed_end=wp.time,
+                    idle_from=d_body + dead, tail_len=tail, tail_offsets=tail_offsets, deadhead=dead,
+                    arrive_lo=arrive_lo, drop_lo=d.start_lo))
+    return out
+
+
+def _pickups_from(day: DayProblem, origin: str, w: Wave, provider: TravelTimeProvider,
+                  cfg: RoutingConfig) -> list[Route]:
+    """地点 origin（送りの最後の家）から出発して施設に戻る前提で、迎えの組み合わせを作る.
+
+    便 w の利用者から chain_pick_max 人までの組をすべて試し、各組の最短の順番を求める。
+    「origin から回って施設に着くまでの時間」が短い組を、人数ごとに chain_pick_keep 組返す。
+    戻り値は施設発のルートとして計算し直したもの（連結は build_chains で行う）。
+    """
+    if not day.cars or not day.staff:
+        return []
+    cap = max(c.capacity for c in day.cars.values())
+    max_walk = max(c.walker_slots for c in day.cars.values())
+    max_chair = max(c.wheelchair_slots for c in day.cars.values())
+    max_skill = max(s.care_skill for s in day.staff.values())
+    uids = [u for u in w.user_ids
+            if day.users[u].care_need <= max_skill and day.users[u].seats <= cap
+            and (not day.users[u].walker or max_walk) and (not day.users[u].wheelchair or max_chair)]
+    ids = [origin, DEPOT] + uids
+    T = build_matrix(ids, provider)
+    ix = {u: i for i, u in enumerate(ids)}
+    svc = {u: day.users[u].service_min for u in uids}
+    out: list[Route] = []
+    for size in range(1, min(cfg.chain_pick_max, cap, len(uids)) + 1):
+        best: list[tuple[int, tuple[str, ...]]] = []
+        for combo in combinations(uids, size):
+            us = [day.users[u] for u in combo]
+            if (sum(u.seats for u in us) > cap or sum(u.walker for u in us) > max_walk
+                    or sum(u.wheelchair for u in us) > max_chair or not day.ng_ok(list(combo))):
+                continue
+            cost, order = None, None
+            for perm in permutations(combo):
+                t, prev = 0, ix[origin]
+                for u in perm:
+                    t += T[prev][ix[u]] + svc[u]
+                    prev = ix[u]
+                t += T[prev][ix[DEPOT]]
+                if cost is None or t < cost:
+                    cost, order = t, perm
+            best.append((cost, order))
+        for cost, order in heapq.nsmallest(cfg.chain_pick_keep, best):
+            r = _make_route(day, w, list(order), provider, cfg)
+            out.append(r)
     return out

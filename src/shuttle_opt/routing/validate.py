@@ -7,7 +7,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from .config import RoutingConfig
-from .data import DayProblem, home_id, min_to_hm
+from .data import DayProblem, hm_to_min, home_id, min_to_hm
 from .route_gen import PlannedRoute
 from . import lunch
 from .travel_time import DEPOT, TravelTimeProvider
@@ -97,6 +97,9 @@ def validate(day: DayProblem, planned: list[PlannedRoute], provider: TravelTimeP
         # 6. シフト
         if not (s.start <= p.start and p.end <= s.work_end):
             errs.append(f"{rid}: {s.staff_id} のシフト外（残業の上限を含む）")
+        if p.end > s.end and not (s.fulltime and s.end == hm_to_min(cfg.overtime_shift_end)
+                                  and p.end - s.end <= cfg.overtime_max):
+            errs.append(f"{rid}: {s.staff_id} は残業できない職員、または残業の上限を超えている")
 
         busy["職員", s.staff_id].append((p.start, p.end, rid))
         busy["車", c.car_id].append((p.start, p.end, rid))

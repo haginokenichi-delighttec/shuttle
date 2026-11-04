@@ -24,7 +24,8 @@
       乗せられない人を減らせるときだけ使われる（走行時間の短縮だけでは使わない）
     - 昼休み: 11:30〜13:30 の間に連続30分以上、送迎しない時間を必ず作る（lunch.py）。
       連結ルート（送り→迎え）の空車待機中に取ってもよい
-    - 連結ルート: 送りで全員降ろしたら施設に戻らず次の迎えへ（候補は route_gen.build_chains）
+    - 連結ルート: 送りで全員降ろしたら施設に戻らず次の迎えへ（候補は route_gen.build_chains）。
+      迎えの組み合わせは送りの最後の家から組み直したものも使い、施設には最大 early_eps 分早く着いてよい
 目的（最小化）
     走行時間 + 1ルートごとの固定費
   + 優先度の低い職員を使うペナルティ + 担当ルート数の最大値
@@ -101,9 +102,10 @@ def _add_direct_rules(m: cp_model.CpModel, day: DayProblem,
 
     first[x] = 選択肢 x がその職員のその日最初のルート（last も同様）。
     最初のルートの出発時刻 E は、担当する全ルートの出発時刻以下になるようにする。
+    E・L は補助変数にする（式のまま各制約に入れると、選択肢の数の2乗の項数になり計算が終わらない）。
     """
     BIG = 24 * 60 * 2
-    aux: dict[str, tuple] = {}   # sid -> (has_any, first変数, last変数)  初期解のヒント用
+    aux: dict[str, tuple] = {}   # sid -> (has_any, first変数, last変数, E, L)  初期解のヒント用
     for sid, opts in staff_opts.items():
         st = day.staff[sid]
         if not (st.direct_start or st.direct_end) or not opts:
@@ -111,11 +113,12 @@ def _add_direct_rules(m: cp_model.CpModel, day: DayProblem,
         xs = [x for _, _, x in opts]
         has_any = m.new_bool_var(f"has_any[{sid}]")
         m.add_max_equality(has_any, xs)
-        f = l = None
+        f = l = E = L = None
         if st.direct_start:
             f = [m.new_bool_var(f"first[{sid},{i}]") for i in range(len(opts))]
             m.add(sum(f) == has_any)
-            E = sum(o * fi for (_, o, _), fi in zip(opts, f))
+            E = m.new_int_var(0, BIG, f"first_start[{sid}]")
+            m.add(E == sum(o * fi for (_, o, _), fi in zip(opts, f)))
             for (r, o, x), fi in zip(opts, f):
                 m.add(fi <= x)
                 m.add(E <= o + BIG * (1 - x))
@@ -126,7 +129,8 @@ def _add_direct_rules(m: cp_model.CpModel, day: DayProblem,
         if st.direct_end:
             l = [m.new_bool_var(f"last[{sid},{i}]") for i in range(len(opts))]
             m.add(sum(l) == has_any)
-            L = sum(r.end_at(o) * li for (r, o, _), li in zip(opts, l))
+            L = m.new_int_var(0, BIG, f"last_end[{sid}]")
+            m.add(L == sum(r.end_at(o) * li for (r, o, _), li in zip(opts, l)))
             for (r, o, x), li in zip(opts, l):
                 m.add(li <= x)
                 m.add(r.end_at(o) <= L + BIG * (1 - x))
@@ -134,7 +138,7 @@ def _add_direct_rules(m: cp_model.CpModel, day: DayProblem,
                     m.add(li == 0)        # 施設着の送りは、その日最後のルートにできない
                 if r.end_pt != "DEPOT":
                     m.add(x <= li)        # 自宅着ルートは必ず最後
-        aux[sid] = (has_any, f, l)
+        aux[sid] = (has_any, f, l, E, L)
     return aux
 
 
@@ -196,7 +200,10 @@ def select_and_assign(day: DayProblem, pool: Pool, cfg: RoutingConfig,
             for wid, uids in r.segments():
                 for uid in uids:
                     cover[wid, uid].append(zz)
-            shift = (r.start_hi - o) if r.kind == "pickup" else (o - r.start_lo)
+            if r.is_chain:   # 送りの出発遅れ + 迎えの早着
+                shift = (o - r.drop_lo) + (r.fixed_end - r.end_at(o))
+            else:
+                shift = (r.start_hi - o) if r.kind == "pickup" else (o - r.start_lo)
             cost_terms.append((r.travel + cfg.vehicle_fixed_cost + cfg.w_time_shift * shift) * zz)
 
     missed = {}
@@ -269,9 +276,13 @@ def select_and_assign(day: DayProblem, pool: Pool, cfg: RoutingConfig,
         for cid, u in help_used.items():
             m.add_hint(u, any(p.car_id == cid for p in hint))
         # 直行・直帰の補助変数
-        for sid, (has_any, f, l) in direct_aux.items():
+        for sid, (has_any, f, l, E, L) in direct_aux.items():
             mine = sorted((p for p in hint if p.staff_id == sid), key=lambda p: p.start)
             m.add_hint(has_any, bool(mine))
+            if E is not None:
+                m.add_hint(E, mine[0].start if mine else 0)
+            if L is not None:
+                m.add_hint(L, max(p.end for p in mine) if mine else 0)
             keys = [(r.route_id, o) for r, o, _ in staff_opts[sid]]
             first = (mine[0].route.route_id, mine[0].start) if mine else None
             last = (mine[-1].route.route_id, mine[-1].start) if mine else None

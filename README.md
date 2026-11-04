@@ -7,10 +7,14 @@ OR-Tools（Routing + CP-SAT）で決めます。結果は CSV で出力し、ル
 
 前提: Python 3.10 以上（`py` ランチャーまたは `python` が使えること）
 
-1. `setup.bat` をダブルクリック → `.venv` 作成と OR-Tools などのインストール
-2. `run_routing.bat` → `attendance.csv` にある全日を計画し、`output\routing\` に結果を出力
+1. `setup.bat` をダブルクリック → `.venv` 作成、OR-Tools などのインストール、ダミーデータ作成
+2. `convert_excel.bat` に送迎テンプレート（.xlsm）をドラッグ＆ドロップ → `data\real\` に CSV を出力
+   - 初回は施設の緯度経度が必要です。コマンドで `convert_excel.bat 送迎テンプレート.xlsm --facility 36.25,137.97`
+     のように指定するか、作成された `data\real\facility.csv` の2行目に「緯度,経度」を書いてください（次回以降は保持されます）
+3. `run_routing.bat` → `data\real\attendance.csv` にある全日を計画し、`output\routing\` に結果を出力
    （日付を指定する場合は `run_routing.bat 2026-11-09`、オプション付きは `run_routing.bat --early 45`）
-3. `test.bat` → テスト実行
+4. `run_sample.bat` → ダミーデータで動作確認（結果は `output\sample\`）
+5. `test.bat` → テスト実行
 
 `run_routing.bat` は日付なしで動くので、ダブルクリックでも実行できます（1日あたり40〜70秒）。
 
@@ -21,7 +25,8 @@ py -3 -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 set PYTHONPATH=src
-python -m shuttle_opt.routing.main --data data\sample_routing --out output\routing
+python -m shuttle_opt.routing.excel_import 送迎テンプレート.xlsm --out data\real --facility 36.25,137.97
+python -m shuttle_opt.routing.main --data data\real --out output\routing
 rem 日付指定（複数可）: python -m shuttle_opt.routing.main 2026-11-09 2026-11-10
 ```
 
@@ -77,6 +82,7 @@ shuttle/
 │  │  └─ _before_fix/       整形前の元データ
 │  └─ real/              実データ（匿名化済みのみ・gitignore）
 ├─ src/shuttle_opt/routing/
+│  ├─ excel_import.py    送迎テンプレート（Excel）→ CSV 変換（氏名・備考列は読まない）
 │  ├─ data.py            CSV 読み込み、当日分の職員・車・利用者、便（到着時刻ごとの迎え／出発時刻ごとの送り）の生成
 │  ├─ heuristic.py       貪欲法による初期解（CP-SAT のヒント兼、CP-SAT が解けないときの代わり）
 │  ├─ travel_time.py     移動時間（直線距離×迂回係数÷平均速度 / 移動時間の表）
@@ -94,7 +100,7 @@ shuttle/
 ├─ docs/                 設計資料・制約条件一覧
 ├─ output/               結果
 ├─ requirements.txt
-└─ setup.bat / run_routing.bat / fetch_matrix.bat / test.bat
+└─ setup.bat / convert_excel.bat / run_routing.bat / run_sample.bat / fetch_matrix.bat / test.bat
 ```
 
 ## 解き方
@@ -108,7 +114,7 @@ shuttle/
 
 ## 入力CSV
 
-`data/sample_routing/`
+`data/real/`（`convert_excel.bat` で作成）または `data/sample_routing/`（`tools/make_dummy_routing.py` で作成）
 
 | ファイル | 列 |
 |---|---|
@@ -117,7 +123,7 @@ shuttle/
 | shifts.csv | date, staff_id, start, end |
 | cars.csv | car_id, capacity, walker_slots, owner_staff_id(空欄=施設車), wheelchair_slots(車椅子の積載数。省略時0), help(ヘルプ車=1。省略時0) |
 | users.csv | user_id, lat, lng, care_need(1〜3), walker(0/1), wheelchair(0/1。省略時0), seats, service_min |
-| attendance.csv | date, user_id, arrive(施設到着時刻), depart(施設出発時刻) |
+| attendance.csv | date, user_id, arrive(施設到着時刻), depart(施設出発時刻)（任意: care_need, walker, wheelchair, service_min … その日の値。空欄は users.csv の値。旧形式の plan_id ＋ plans.csv も可） |
 | ng_pairs.csv | user_a, user_b（同じ車に同時に乗せない利用者の組。1行1組。ファイルがなければ制約なし） |
 
 - 日付は `2026-11-09` でも `2026/11/9` でも読み込める。時刻は `9:00` / `09:00` どちらでもよい。
@@ -142,7 +148,7 @@ shuttle/
 ### 送り→迎えの連結（施設に戻らず次の迎えへ）
 - 送りで利用者を全員降ろしたら、施設に戻らずそのまま後の便の迎えに向かってよい（例：12:00発の送り → 13:30着の迎え）。
 - 送り終わりから次の迎えまでは、空車で待機してよい（最大60分。`chain_max_wait`）。待機時間は `routes_<日付>.csv` の「空車待機」列と timeline に表示。
-- 連結は「施設に戻って出直すより移動が短くなる」組を優先し、短くならなくても（15分の遠回りまで。`chain_min_saving`）時間的に次の迎えに間に合うようになる組も候補にする（送りルート1本につき6本まで。`chain_per_route`）。施設に戻らない分、ルート1本分の固定費と準備時間が減るので、時短や乗せられる人が増える場合は積極的に選ばれる。
+- 連結は「施設に戻って出直すより移動が短くなる」組を優先し、短くならなくても（15分の遠回りまで。`chain_min_saving`）時間的に次の迎えに間に合うようになる組も候補にする（送りルート1本につき6本まで。`chain_per_route`）。施設に戻らない分、ルート1本分の固定費と準備時間が減るので、時短や乗せられる人が増える場合は積極的に選ばれる。 迎えは送りの最後の家から組み直した組も使い、1組につき定刻型と早着型（施設に最大20分早く着く）の2通りを候補にする。
 - 連結ルートは施設での準備時間（10分）を挟まない。送りの人と迎えの人が同時に乗ることはないので、定員などは送り・迎えそれぞれで判定する。
 - 使わない場合は `config.py` の `chain_enabled = False`。
 - 連結ルートの Google マップURLは、送りと迎えの家を順に全部立ち寄る1本のURLになる（最大6か所。スマホのブラウザでは立ち寄り数の上限に注意）。
@@ -224,10 +230,21 @@ fetch_matrix.bat --refresh   … 全件取り直し
 | Routes API エラー 429 | 上の「利用上限への対応」を参照 |
 | 実行中に何も表示されないように見える | 1日あたり40〜70秒かかる。`output\routing\logs\` のログで進み具合を確認できる |
 
+## Excel からの変換ルール
+
+| Excel シート | CSV | ルール |
+|---|---|---|
+| シフト（「希望休_設定」の対象シート名、なければ「月次シフト」「○月_シフト」。生成対象=対象） | staff / shifts | 職員区分 → employment（「常勤」が残業の対象）。直行・直帰（1）と座標（自宅の緯度・経度）→ direct_start / direct_end / home_lat / home_lng。優先順位は大きいほど優先。シフト記号「日」= その職員の勤務開始/終了時間、「〇」・空欄 = 休み、その他 = 勤務パターンマスターの時刻 |
+| 車両情報 | cars | B列の車名を ID に。送迎可能人数 = 定員（利用者数）、歩行器積載。車名に「ヘルプ」を含む車はヘルプ車（help=1） |
+| 利用者情報 | users / attendance / ng_pairs | 施設着・施設発 = その日の到着・出発時刻（旧形式は 利用時間帯 = プランID）、介助 空欄/中/重 = 1/2/3、持参品「歩行器」= 歩行器あり、乗車必要時間（空欄は5分）、組み合わせ禁止（「P0013/P0007」形式） |
+| 送迎情報 | plans | ID・到着時間・出発時間（旧形式で施設着・施設発が空欄のときだけ使う） |
+
+- 日によって座標が違う利用者は、最も新しい日の座標に統一します（警告あり）。介助・歩行器・乗車必要時間は日ごとの値を使います。
+- 氏名（名前列）・職員名・備考欄は読み込みません。備考に書かれた運用ルールを計算に反映したい場合は、該当する列に入力してください。
+
 ## 今後の拡張候補
 
-- 実データ（xlsm）の匿名化・CSV変換スクリプト
-- 最大乗車時間・同乗希望などの現場ルール
+- 最大乗車時間・同乗希望・迎え時刻の指定などの現場ルール
 - 乗せられない利用者の一覧ファイル出力
 - Excel 出力・地図表示
 
@@ -237,3 +254,16 @@ fetch_matrix.bat --refresh   … 全件取り直し
 実データは `data/real/` に置く想定で、`.gitignore` により管理対象外にしています。ID と実名の対応表は本システムの外で管理してください。
 現在 `data/sample_routing/` には利用者宅の実座標が入っているため、`data/real/` への移動を推奨します。
 出力ファイル（URL を含む）や Google API の取得結果も個人情報として扱ってください。
+元の Excel（`00_doc/`・`*.xlsx`・`*.xlsm`）も `.gitignore` で管理対象外にしています。
+
+## 送迎表ビューア（ブラウザで表示・編集）
+
+1. `run_routing.bat` を実行（`output\routing\view_<日付>.json` も出力される）
+2. 氏名を表示したいときは `export_names.bat` に送迎テンプレートの Excel をドラッグ＆ドロップ
+   （`data\real\names.csv` を作成。氏名を含むので外部に出さない）
+3. `viewer\送迎表.html` を Edge / Chrome で開き、「フォルダを開く」で `C:\shuttle` を選ぶ
+4. 職員・車はプルダウン、利用者はドラッグで並べ替え・別の車へ移動、「＋便を追加」「削除」で便を増減
+5. 「保存」で `output\routing\routes_<日付>_edit.csv` / `stops_<日付>_edit.csv` に保存（元の CSV は変更しない）
+
+- 時刻・チェックはソルバー（validate.py）と同じルールで、view_<日付>.json の移動時間表を使って計算する
+- 地図は国土地理院の地理院タイル（インターネット接続が必要。右上で淡色・標準・航空写真を切替）。線は立ち寄り順を直線で結んだもの

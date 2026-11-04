@@ -399,3 +399,85 @@ def test_overtime_only_for_fulltime_17(tmp_path):
     day2 = load_day(tmp_path, DATE, cfg2)
     plan2 = plan_day(day2, _provider(day2, cfg2), cfg2)
     assert plan2.dropped == {"送り16:50": ["U1"]}
+
+
+def test_ng_pair_not_in_same_route(tmp_path):
+    """同乗NGの2人は、近所でも別のルートになる."""
+    users = [("U1", 35.004, 135.003, 1, 0, 1, 3), ("U2", 35.0045, 135.003, 1, 0, 1, 3),
+             ("U3", 35.005, 135.004, 1, 0, 1, 3)]
+    staff = [("S1", 5, 3), ("S2", 5, 3)]
+    _write(tmp_path, users, staff, [(DATE, s, "07:30", "17:00") for s, *_ in staff],
+           [("C1", 4, 0, ""), ("C2", 4, 0, "")], [("P1", "09:00", "12:00")],
+           [(DATE, u, "P1") for u, *_ in users])
+    pd.DataFrame([{"user_a": "U1", "user_b": "U2"}]).to_csv(tmp_path / "ng_pairs.csv", index=False)
+    cfg = RoutingConfig(assign_time_limit_sec=10)
+    day = load_day(tmp_path, DATE)
+    prov = _provider(day, cfg)
+    plan = plan_day(day, prov, cfg)
+    assert plan.ok and plan.dropped == {}
+    for p in plan.planned:
+        assert not {"U1", "U2"} <= set(p.route.stops)
+    assert validate(day, plan.planned, prov, cfg) == []
+
+
+def test_chain_early_arrival_timing():
+    """早着型の連結ルート: 待たずに回り、施設には到着時刻より早く着いてよい（arrive_lo まで）."""
+    from shuttle_opt.routing.route_gen import PlannedRoute, Route
+    # 出発→迎えの1人目まで 30分、迎えの1人目→施設 20分。到着時刻 13:00、12:40 から着いてよい
+    r = Route("c", "w1", "chain", ["U1", "U2"], [10], 100, 1, 0, 1, 40,
+              wave2="w2", n_first=1, fixed_end=hm_to_min("13:00"), idle_from=30, tail_len=20,
+              tail_offsets=[-20], arrive_lo=hm_to_min("12:40"))
+    p = PlannedRoute(r, "S1", "C1", hm_to_min("12:00"))          # 待たずに回る → 12:50 着
+    assert p.end == hm_to_min("12:50")
+    assert p.idle == (hm_to_min("12:30"), hm_to_min("12:30"))
+    assert p.eta == [hm_to_min("12:10"), hm_to_min("12:30")]
+    p2 = PlannedRoute(r, "S1", "C1", hm_to_min("11:40"))         # 早すぎる → 12:40 着になるよう待つ
+    assert p2.end == hm_to_min("12:40")
+    assert p2.idle == (hm_to_min("12:10"), hm_to_min("12:20"))
+    p3 = PlannedRoute(r, "S1", "C1", hm_to_min("12:10"))         # ちょうど 13:00 着
+    assert p3.end == hm_to_min("13:00")
+
+
+def test_pickups_from_last_dropoff_house(tmp_path):
+    """送りの最後の家から出発する前提で、迎えの組み合わせを組み直す."""
+    from shuttle_opt.routing.route_gen import _pickups_from
+    # 送りの U1 は北 5km。迎え: U2 は U1 のすぐ近く、U3 は施設の東、U4 は南
+    users = [("U1", 35.045, 135.0, 1, 0, 1, 3), ("U2", 35.046, 135.001, 1, 0, 1, 3),
+             ("U3", 35.0, 135.03, 1, 0, 1, 3), ("U4", 34.955, 135.0, 1, 0, 1, 3)]
+    _write(tmp_path, users, [("S1", 5, 3)], [(DATE, "S1", "08:00", "17:00")],
+           [("C1", 3, 0, "")], [("P1", "09:00", "12:00"), ("P2", "13:00", "16:00")],
+           [(DATE, "U1", "P1"), (DATE, "U2", "P2"), (DATE, "U3", "P2"), (DATE, "U4", "P2")])
+    cfg = RoutingConfig()
+    day = load_day(tmp_path, DATE)
+    w = next(w for w in day.waves if w.wave_id == "迎え13:00")
+    rs = _pickups_from(day, "U1", w, _provider(day, cfg), cfg)
+    singles = [r.stops for r in rs if len(r.stops) == 1]
+    assert singles[0] == ["U2"]                       # 1人なら U1 のすぐ近くの U2 が最良
+    assert any(len(r.stops) == 3 for r in rs)          # 3人の組も作る
+    assert all(r.wave_id == w.wave_id for r in rs)
+
+
+def test_overtime_for_fulltime_staff(tmp_path):
+    """常勤・17:00終業の職員は、残業して送り16:30を担当できる（非常勤・設定0では不可）."""
+    users = [("U1", 35.07, 135.0, 1, 0, 1, 3)]       # 北 約8km（片道 約25分）
+    _write(tmp_path, users, [("S1", 5, 3)], [(DATE, "S1", "08:00", "17:00")],
+           [("C1", 3, 0, "")], [("P1", "13:30", "16:30")], [(DATE, "U1", "P1")])
+    cfg = RoutingConfig(assign_time_limit_sec=10)
+
+    def run(employment, c):
+        pd.DataFrame([("S1", 5, 3, employment)], columns=["staff_id", "priority", "care_skill", "employment"]).to_csv(
+            tmp_path / "staff.csv", index=False)
+        day = load_day(tmp_path, DATE, c)
+        prov = _provider(day, c)
+        return day, prov, plan_day(day, prov, c)
+
+    day, prov, plan = run("常勤", cfg)
+    assert plan.dropped == {}
+    drop = next(p for p in plan.planned if p.route.kind == "dropoff")
+    assert drop.end > hm_to_min("17:00")
+    assert day.staff["S1"].overtime(drop.end) <= cfg.overtime_max
+    assert validate(day, plan.planned, prov, cfg) == []
+    _, _, plan2 = run("パート", cfg)                  # 非常勤は残業なし
+    assert any(w.startswith("送り") for w in plan2.dropped)
+    _, _, plan3 = run("常勤", RoutingConfig(assign_time_limit_sec=10, overtime_max=0))
+    assert any(w.startswith("送り") for w in plan3.dropped)

@@ -32,12 +32,17 @@ class RoutingConfig:
     # 送り→迎えの連結（送りで全員降ろしたら施設に戻らず次の迎えへ）
     chain_enabled: bool = True
     chain_max_wait: int = 60     # 送り終わりから次の迎えまで、空車で待ってよい最大分数
-    chain_per_route: int = 6     # 送りルート1本につき作る連結候補の数
+    chain_per_route: int = 6     # 送りルート1本につき作る連結の組の数（1組につき定刻型・早着型の2通り）
     chain_min_saving: int = -15  # 施設に戻るより何分まで長くなっても候補にするか（時間的に間に合わせるため）
+    chain_pick_max: int = 3      # 送りの最後の家から組み直す迎えの最大人数
+    chain_pick_keep: int = 3     # 組み直した迎えを、人数ごとに何組残すか
 
     # 運用
     turnaround_min: int = 10     # ルートの間に必要な準備時間（職員・車とも）
     max_route_min: int = 120     # 1ルートの所要時間の上限（施設を出てから戻るまで）
+    staff_before_pickup: int = 10   # 迎え便を担当できる職員: 施設到着時刻の何分前までに出勤しているか
+    staff_after_dropoff: int = 15   # 送り便を担当できる職員: 施設出発時刻の何分後まで勤務しているか
+
 
     # Stage A: 候補ルート生成
     vehicle_fixed_cost: int = 30           # ルートを1本増やすコスト（分換算）
@@ -51,6 +56,6 @@ class RoutingConfig:
     w_time_shift: int = 1        # 迎えの早着・送りの出発遅れ（1分あたり）
     drop_penalty: int = 100_000  # 利用者を乗せられないときのペナルティ
     w_help_car: int = 10_000     # ヘルプ車を1台使うペナルティ（乗せられない人を減らせるときだけ使われる）
-    assign_time_limit_sec: int = 30
+    assign_time_limit_sec: int = 60   # CP-SAT の計算時間（1回あたり・秒）。2026-11-04 30→60
     num_workers: int = field(default_factory=lambda: max(1, min(8, os.cpu_count() or 1)))  # CP-SAT の並列数（CPUコア数まで）
     start_step: int = 10         # 出発時刻の候補の刻み（分）。小さくすると細かくなるが計算が重くなる

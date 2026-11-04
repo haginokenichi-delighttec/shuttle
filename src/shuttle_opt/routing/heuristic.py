@@ -1,6 +1,8 @@
 """貪欲法による初期解.
 
 CP-SAT（assign.py）は問題が大きくなると、時間内に良い解を見つけられないことがある。
+歩行器・車椅子・介助2以上の利用者を含むルートを先に割り当て、歩行器・車椅子の枠のある車は
+その枠が必要なルートのために温存する（2026-11-04）。
 そこで、候補ルートから「多くの利用者をまとめて運べる・走行の短い」ものを順に選び、
 空いている職員・車に割り当てていく簡単な方法で、ルールを満たす計画をまず1つ作る。
 これを CP-SAT の初期解（ヒント）にして改善させる。CP-SAT が解を返せなかったときは、この計画をそのまま使う。
@@ -46,6 +48,9 @@ def greedy_plan(day: DayProblem, pool: Pool, cfg: RoutingConfig, use_help: bool 
         if not cars:
             continue
         n = len(r.stops)
+        us = [day.users[u] for u in r.stops]
+        # 条件の厳しい利用者（歩行器・車椅子・介助2以上）を含むルートを先に割り当てる
+        hard = any(u.walker or u.wheelchair or u.care_need >= 2 for u in us)
         for o in start_options(r, cfg.start_step):
             for sid in compatible_staff(day, r, o):
                 for cid in cars:
@@ -53,8 +58,11 @@ def greedy_plan(day: DayProblem, pool: Pool, cfg: RoutingConfig, use_help: bool 
                         continue
                     st, car = day.staff[sid], day.cars[cid]
                     ot = max(0, r.end_at(o) - st.end)
-                    key = (-n,                                   # 多くの人を運べるもの
-                           car.help, ot,                         # ヘルプ車・残業はなるべく使わない
+                    # 歩行器・車椅子の枠を使わないルートに、その枠のある車を使うのは後回し（枠を温存する）
+                    waste = int(car.walker_slots > r.walkers) + int(car.wheelchair_slots > r.wheelchairs)
+                    key = (not hard,                             # 条件の厳しい利用者を含むもの
+                           -n,                                   # 多くの人を運べるもの
+                           car.help, waste, ot,                  # ヘルプ車・枠の無駄・残業はなるべく避ける
                            r.travel / n,                         # 1人あたりの走行が短いもの
                            p_max - st.priority,                  # 優先度の高い職員
                            abs(o - r.start_hi) if r.kind == "pickup" else o - r.start_lo)

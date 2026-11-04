@@ -57,11 +57,16 @@ class Staff:
     direct_start: bool = False   # 直行: 朝は自宅から迎えに出る
     direct_end: bool = False     # 直帰: 夕方は送りの後そのまま自宅へ帰る
     overtime_max: int = 0        # 残業してよい最大分数（常勤で定時に終わる人のみ）
+    fulltime: bool = False       # 常勤（staff.csv の employment 列が「常勤」、または fulltime=1）
 
     @property
     def work_end(self) -> int:
         """残業を含めて働ける最終時刻."""
         return self.end + self.overtime_max
+
+    def overtime(self, end_at: int) -> int:
+        """その時刻に戻ったときの残業分数."""
+        return max(0, end_at - self.end)
 
 
 @dataclass
@@ -139,9 +144,14 @@ class DayProblem:
         return out
 
 
+def _read(path: Path, **kw) -> pd.DataFrame:
+    """CSV読み込み. Excel で保存した BOM 付き UTF-8 も読めるようにする."""
+    return pd.read_csv(path, encoding="utf-8-sig", **kw)
+
+
 def list_dates(data_dir: str | Path) -> list[str]:
     """attendance.csv に出てくる日付（昇順）."""
-    df = pd.read_csv(Path(data_dir) / "attendance.csv", dtype=str)
+    df = _read(Path(data_dir) / "attendance.csv", dtype=str)
     df.columns = [c.strip() for c in df.columns]
     return sorted({norm_date(d) for d in df["date"].dropna()})
 
@@ -151,12 +161,16 @@ def load_day(data_dir: str | Path, date: str, cfg=None) -> DayProblem:
     from .config import RoutingConfig
     cfg = cfg or RoutingConfig()
     d = Path(data_dir)
-    fac = pd.read_csv(d / "facility.csv").iloc[0]
-    df_staff = pd.read_csv(d / "staff.csv", dtype={"staff_id": str})
-    df_shift = pd.read_csv(d / "shifts.csv", dtype=str)
-    df_cars = pd.read_csv(d / "cars.csv", dtype={"car_id": str, "owner_staff_id": str})
-    df_users = pd.read_csv(d / "users.csv", dtype={"user_id": str})
-    df_att = pd.read_csv(d / "attendance.csv", dtype=str)
+    fac = _read(d / "facility.csv")
+    fac.columns = [c.strip() for c in fac.columns]
+    if fac.empty or fac[["lat", "lng"]].iloc[0].isna().any():
+        raise ValueError(f"施設の緯度経度が未設定です（{d / 'facility.csv'} の lat, lng を入力してください）")
+    fac = fac.iloc[0]
+    df_staff = _read(d / "staff.csv", dtype={"staff_id": str})
+    df_shift = _read(d / "shifts.csv", dtype=str)
+    df_cars = _read(d / "cars.csv", dtype={"car_id": str, "owner_staff_id": str})
+    df_users = _read(d / "users.csv", dtype={"user_id": str})
+    df_att = _read(d / "attendance.csv", dtype=str)
 
     date = norm_date(date)
     for df in (df_staff, df_shift, df_cars, df_users, df_att):
@@ -169,7 +183,7 @@ def load_day(data_dir: str | Path, date: str, cfg=None) -> DayProblem:
             df[c] = df[c].astype(str).str.strip()
     if not {"arrive", "depart"} <= set(df_att.columns):
         # 旧形式（plan_id + plans.csv）にも対応
-        df_plans = pd.read_csv(d / "plans.csv", dtype=str)
+        df_plans = _read(d / "plans.csv", dtype=str)
         df_plans.columns = [c.strip() for c in df_plans.columns]
         df_plans["plan_id"] = df_plans["plan_id"].astype(str).str.strip()
         df_att["plan_id"] = df_att["plan_id"].astype(str).str.strip()
@@ -192,12 +206,18 @@ def load_day(data_dir: str | Path, date: str, cfg=None) -> DayProblem:
         if (ds or de) and home is None:
             raise ValueError(f"staff.csv: {r.staff_id} は直行/直帰ですが自宅座標（home_lat, home_lng）がありません")
         start, end = hm_to_min(sh["start"]), hm_to_min(sh["end"])
-        # 常勤（fulltime=1。列がなければ勤務7時間以上を常勤とみなす）で定時に終わる人は残業可
-        ft = getattr(r, "fulltime", None)
-        fulltime = bool(_int(ft)) if _float(ft) is not None else (end - start >= 7 * 60)
+        # 常勤の判定: employment 列（Excel の職員区分）が「常勤」 → なければ fulltime 列（1/0）
+        # → どちらもなければ勤務7時間以上を常勤とみなす。常勤で定時に終わる人は残業可
+        emp, ft = getattr(r, "employment", None), getattr(r, "fulltime", None)
+        if isinstance(emp, str) and emp.strip():
+            fulltime = emp.strip() == "常勤"
+        elif _float(ft) is not None:
+            fulltime = bool(_int(ft))
+        else:
+            fulltime = end - start >= 7 * 60
         ot = cfg.overtime_max if (cfg.overtime_enabled and fulltime and end == hm_to_min(cfg.overtime_shift_end)) else 0
         staff[r.staff_id] = Staff(r.staff_id, int(r.priority), int(r.care_skill),
-                                  start, end, home, ds, de, ot)
+                                  start, end, home, ds, de, overtime_max=ot, fulltime=fulltime)
 
     cars = {}
     for r in df_cars.itertuples(index=False):
@@ -215,13 +235,23 @@ def load_day(data_dir: str | Path, date: str, cfg=None) -> DayProblem:
         if pd.isna(r.arrive) or pd.isna(r.depart):
             raise ValueError(f"attendance.csv: {date} {r.user_id} の到着時刻・出発時刻がありません")
         times[r.user_id] = (hm_to_min(r.arrive), hm_to_min(r.depart))
+    # attendance.csv に介助・歩行器などの列があれば、その日の値を優先する（空欄は users.csv の値）
+    day_attr = {r["user_id"]: r for r in att.to_dict("records")}
+
+    def attr(uid: str, row, col: str, default: int) -> int:
+        v = day_attr[uid].get(col)
+        if v is not None and not (isinstance(v, float) and pd.isna(v)) and str(v).strip() != "":
+            return _int(v)
+        return _int(getattr(row, col, None), default)
+
     users = {}
     for r in df_users.itertuples(index=False):
         if r.user_id in times:
-            a, dep = times[r.user_id]
-            users[r.user_id] = User(r.user_id, float(r.lat), float(r.lng), _int(r.care_need, 1),
-                                    _int(r.walker), _int(r.seats, 1), _int(r.service_min, 5),
-                                    a, dep, _int(getattr(r, "wheelchair", 0)))
+            u = r.user_id
+            a, dep = times[u]
+            users[u] = User(u, float(r.lat), float(r.lng), attr(u, r, "care_need", 1),
+                            attr(u, r, "walker", 0), _int(r.seats, 1), attr(u, r, "service_min", 5),
+                            a, dep, attr(u, r, "wheelchair", 0))
     missing = set(times) - set(users)
     if missing:
         raise ValueError(f"users.csv に存在しない利用者ID: {sorted(missing)}")
@@ -238,7 +268,7 @@ def load_day(data_dir: str | Path, date: str, cfg=None) -> DayProblem:
 
     ng: set[frozenset[str]] = set()
     if (d / "ng_pairs.csv").exists():
-        df_ng = pd.read_csv(d / "ng_pairs.csv", dtype=str)
+        df_ng = _read(d / "ng_pairs.csv", dtype=str)
         df_ng.columns = [c.strip() for c in df_ng.columns]
         for r in df_ng.itertuples(index=False):
             a, b = str(r.user_a).strip(), str(r.user_b).strip()

@@ -7,3 +7,15 @@ output/*
 
 # 実データは個人情報を含む可能性があるため管理対象外
 data/real/
+
+# 元の Excel（氏名・住所・備考などを含む）は管理対象外
+00_doc/
+*.xlsx
+*.xlsm
+~$*
+
+# setup.bat / run_sample.bat で生成するダミーデータ
+data/sample_routing/
+
+# 実データのバックアップ（data/real_bak_日付 など）も管理対象外
+data/real*/

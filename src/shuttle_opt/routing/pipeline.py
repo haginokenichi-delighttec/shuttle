@@ -112,7 +112,7 @@ def _reason(day: DayProblem, pool, wave_id: str, uid: str) -> str:
 
     if not any(ok(r) for r in cands):
         return (f"介助レベル{u.care_need}・歩行器{u.walker}・車椅子{u.wheelchair}の条件を満たす"
-                "職員・車の組がその時間帯にいない")
+                "職員・車の組がいない（勤務時間内に施設へ戻れない可能性）")
     return "職員・車の空き時間が足りない（同じ時間帯の便と重なる）"
 
 
@@ -137,7 +137,8 @@ def describe(day: DayProblem, plan: DayPlan) -> str:
         lunch_txt = f" ／ 昼休み {min_to_hm(br[0])}-{min_to_hm(br[1])}" if br else ""
         ot = overtime(day, plan).get(sid, 0)
         lunch_txt += f" ／ 残業 {ot}分" if ot else ""
-        lines.append(f"■ {sid}（優先度{s.priority}・介助{s.care_skill}{direct}・勤務 {min_to_hm(s.start)}-{min_to_hm(s.end)}）"
+        ot_ok = f"・残業可〜{min_to_hm(s.work_end)}" if s.overtime_max else ""
+        lines.append(f"■ {sid}（優先度{s.priority}・介助{s.care_skill}{direct}・勤務 {min_to_hm(s.start)}-{min_to_hm(s.end)}{ot_ok}）"
                      f" 担当 {len(ps)} 本{lunch_txt}")
         for p in ps:
             r = p.route
@@ -152,6 +153,7 @@ def describe(day: DayProblem, plan: DayPlan) -> str:
             else:
                 route_txt, label = " → ".join(parts), r.wave_id
             car = f"{p.car_id}(ヘルプ)" if day.cars[p.car_id].help else p.car_id
+            ot = s.overtime(p.end)
             lines.append(f"   {min_to_hm(p.start)}-{min_to_hm(p.end)} {car} {label}: "
-                         f"{sp} → {route_txt} → {ep}")
+                         f"{sp} → {route_txt} → {ep}" + (f"  【残業 {ot} 分】" if ot else ""))
     return "\n".join(lines)
