@@ -1,0 +1,890 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>送迎表</title>
+<!--
+  送迎表ビューア（C:\shuttle\viewer\送迎表.html）
+  ・Edge / Chrome で開き、「フォルダを開く」で C:\shuttle を選ぶ
+  ・読むファイル  output\routing\view_<日付>.json / routes_<日付>.csv（修正版 routes_<日付>_edit.csv を優先）
+                  data\real\names.csv（氏名。無ければIDで表示）
+  ・保存するファイル output\routing\routes_<日付>_edit.csv / stops_<日付>_edit.csv（元のCSVは変更しない）
+  ・左の便をクリックするとその便だけ地図に表示（Ctrl+クリックで複数、Esc・「全体表示」で解除）
+  ・データは手元のPCの中だけで扱う。外部に送るのは地図の画像（国土地理院 地理院タイル）の取得だけ
+-->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+:root{
+  --text:#1f2328;--sub:#6a737d;--line:#d0d7de;--bg:#f6f7f9;
+  --pick:#1a9bd7;--drop:#4caf3f;--chip:#1f4e79;--warn:#d1242f;--ok:#1a7f37;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font-family:"Yu Gothic UI","Meiryo",-apple-system,"Hiragino Sans",sans-serif;color:var(--text);background:#fff;font-size:14px}
+button{font:inherit;cursor:pointer}
+.app{display:grid;grid-template-columns:minmax(640px,1fr) 38%;height:100vh}
+.left{overflow:auto;padding:12px 16px 40px}
+.right{border-left:1px solid var(--line);position:relative}
+#map{position:absolute;inset:0}
+#mapMsg{position:absolute;inset:0;display:none;align-items:center;justify-content:center;color:var(--sub);background:#fafafa;padding:20px;text-align:center}
+
+/* ツールバー */
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+.toolbar button{border:1px solid var(--line);background:#fff;border-radius:6px;padding:5px 10px}
+.toolbar button.primary{background:var(--chip);color:#fff;border-color:var(--chip)}
+.toolbar button:disabled{opacity:.45;cursor:default}
+.toolbar .sp{flex:1}
+.status{font-size:12px;color:var(--sub)}
+.status.dirty{color:var(--warn);font-weight:700}
+.badge-edit{background:#fff4ce;border:1px solid #e9c46a;border-radius:4px;padding:1px 6px;font-size:12px}
+
+/* 見出し（日付・カレンダー・便ボタン） */
+.head{display:flex;gap:18px;align-items:flex-start;margin-bottom:10px;flex-wrap:wrap}
+/* 昼休み */
+.lunch{border:1px solid var(--line);border-radius:6px;padding:6px 10px;font-size:12px;min-width:210px}
+.lunch:empty{display:none}
+.lunch h4{margin:0 0 4px;font-size:13px}
+.lunch h4 small{font-weight:400;color:var(--sub);margin-left:4px}
+.lunch table{border-collapse:collapse}
+.lunch td{padding:1px 8px 1px 0;white-space:nowrap;vertical-align:top}
+.lunch td small{color:var(--sub);margin-left:3px}
+.lunch .ng{color:var(--warn);font-weight:700}
+.lunch .off{color:var(--sub)}
+.lunch .car{color:#8250df;font-weight:600;margin-left:4px}
+.dateTitle{font-size:20px;font-weight:700;margin:0 0 6px}
+.cal{border:1px solid #e0a46a;border-radius:6px;width:236px;font-size:12px;overflow:hidden}
+.cal .ch{display:flex;justify-content:space-between;align-items:center;background:#e8833a;color:#fff;padding:3px 6px}
+.cal .ch button{background:none;border:none;color:#fff;font-size:14px;padding:0 6px}
+.cal table{border-collapse:collapse;width:100%;table-layout:fixed}
+.cal th{font-weight:400;color:var(--sub);padding:2px 0}
+.cal td{text-align:center;padding:3px 0;color:#bbb}
+.cal td.has{color:var(--text);font-weight:700;cursor:pointer}
+.cal td.has:hover{background:#fde7d3}
+.cal td.sel{background:#e8833a;color:#fff}
+.cal td.sun{color:#e0a0a0}.cal td.has.sun{color:#d63b3b}
+.cal td.sat{color:#a0b8e0}.cal td.has.sat{color:#2f6fde}
+.cal td.sel.sun,.cal td.sel.sat{color:#fff}
+.waves{display:grid;grid-template-columns:repeat(2,minmax(140px,1fr));gap:8px;align-content:start}
+.wbtn{border:none;border-radius:6px;color:#fff;padding:8px 10px;font-size:14px;text-align:center;opacity:.55}
+.wbtn.pick{background:var(--pick)}.wbtn.drop{background:var(--drop)}
+.wbtn.all{background:#6a737d;grid-column:1 / -1}
+.wbtn.on{opacity:1;box-shadow:0 0 0 3px rgba(0,0,0,.15)}
+.wbtn small{display:block;font-size:11px;opacity:.9}
+
+/* 便グループ */
+.group{margin-top:14px;border-top:2px solid var(--line);padding-top:8px}
+.group h3{margin:0 0 6px;font-size:15px;display:flex;align-items:center;gap:8px}
+.group h3 .tag{color:#fff;border-radius:4px;padding:2px 8px;font-size:13px}
+.group h3 .tag.pick{background:var(--pick)}.group h3 .tag.drop{background:var(--drop)}
+.group h3 .cnt{font-weight:400;font-size:12px;color:var(--sub)}
+.group h3 button{margin-left:auto;border:1px dashed var(--chip);background:#fff;color:var(--chip);border-radius:6px;padding:2px 10px;font-size:12px}
+
+/* ルート行 */
+.row{display:flex;align-items:flex-start;gap:6px;padding:6px 4px;border-radius:6px;border-left:5px solid transparent}
+.row:hover,.row.hl{background:#f3f7fb}
+.row{cursor:pointer}
+.row.sel{background:#e3eefa;box-shadow:inset 0 0 0 2px #7aa7d6}
+.mapsel{background:#fff;border-radius:6px;box-shadow:0 1px 4px rgba(0,0,0,.35);padding:5px 8px;font-size:13px;display:none;align-items:center;gap:8px}
+.mapsel button{border:1px solid var(--line);background:#fff;border-radius:5px;padding:2px 8px}
+.row .who{display:flex;flex-direction:column;gap:3px;width:138px;flex:none}
+.row select{font:inherit;padding:2px 2px;border:1px solid var(--line);border-radius:4px;background:#fff;width:100%}
+.row .tm{width:100px;flex:none;font-size:13px;line-height:1.35}
+.row .tm input{width:96px;font:inherit;padding:1px 2px;border:1px solid var(--line);border-radius:4px}
+.row .tm .lbl{font-size:11px;color:var(--sub)}
+.chips{display:flex;flex-wrap:wrap;align-items:center;gap:4px;flex:1;min-height:52px;padding:2px;border-radius:6px}
+.chips.over{background:#e6f0ff;outline:2px dashed #7aa7e0}
+.chip{border:1.5px solid var(--chip);border-radius:8px;background:#fff;padding:3px 8px 2px;min-width:108px;cursor:grab;user-select:none;position:relative}
+.chip .nm{font-size:15px;text-align:center;white-space:nowrap}
+.chip .nm small{font-size:10px;color:var(--sub);margin-left:3px}
+.chip .t{font-size:11px;color:#333;white-space:nowrap;text-align:center}
+.chip .ic{font-size:10px;color:#fff;background:#8a6d3b;border-radius:3px;padding:0 3px;margin-left:4px;vertical-align:2px}
+.chip.dragging{opacity:.35}
+.chip.ins-l{box-shadow:-4px 0 0 #2f6fde}
+.chip.ins-r{box-shadow:4px 0 0 #2f6fde}
+.chip.ng{border-color:var(--warn);background:#fff1f0}
+.arrow{color:var(--chip);font-size:10px}
+.endt{font-size:12px;color:var(--sub);white-space:nowrap;margin-left:4px}
+.endt.chain{color:#8250df;font-weight:600}
+.ops{display:flex;flex-direction:column;gap:3px;flex:none}
+.ops a,.ops button{font-size:11px;border:1px solid var(--line);background:#fff;border-radius:4px;padding:1px 6px;color:var(--text);text-decoration:none;text-align:center}
+.ops button.del:hover{background:#fff1f0;border-color:var(--warn);color:var(--warn)}
+.msgs{margin:0 0 4px 165px;font-size:12px;color:var(--warn)}
+.msgs div::before{content:"⚠ "}
+.pool{display:flex;gap:6px;align-items:flex-start;margin-top:4px;padding:6px 4px;border:1px dashed #e0a0a0;border-radius:6px;background:#fffafa}
+.pool .plbl{width:138px;flex:none;font-size:12px;color:var(--warn);font-weight:700;padding-top:6px}
+.pool.empty{border-color:var(--line);background:#fafafa}
+.pool.empty .plbl{color:var(--sub);font-weight:400}
+.empty-note{color:var(--sub);padding:30px 0;text-align:center;line-height:1.8}
+.sumbar{display:flex;gap:14px;font-size:12px;color:var(--sub);margin:4px 0 0}
+.sumbar b{color:var(--text)}
+.sumbar .bad{color:var(--warn)}
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:#1f2328;color:#fff;padding:8px 16px;border-radius:20px;font-size:13px;display:none;z-index:2000}
+.num-icon{border-radius:50%;color:#fff;font-weight:700;font-size:12px;width:22px;height:22px;line-height:22px;text-align:center;border:2px solid #fff;box-shadow:0 1px 3px rgba(0,0,0,.4)}
+.home-icon{font-size:22px;line-height:22px;text-align:center}
+@media print{
+  .toolbar,.ops,.pool,.group h3 button{display:none!important}
+  .app{display:block;height:auto}
+  .right{display:none}
+  .left{overflow:visible}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="left">
+    <div class="toolbar">
+      <button class="primary" id="bOpen" onclick="openFolder()">フォルダを開く</button>
+      <button id="bReopen" style="display:none" onclick="reopenFolder()">前回のフォルダを開く</button>
+      <input type="file" id="dirInput" webkitdirectory multiple style="display:none" onchange="onDirInput(this)">
+      <button id="bUndo" onclick="undo()" disabled title="Ctrl+Z">↶ 元に戻す</button>
+      <button id="bSave" onclick="save()" disabled>保存</button>
+      <button id="bReset" onclick="resetToOriginal()" disabled>元の計画に戻す</button>
+      <button onclick="window.print()">印刷</button>
+      <label style="font-size:12px"><input type="checkbox" id="chkId" onchange="render()"> IDも表示</label>
+      <span class="sp"></span>
+      <span class="status" id="status">フォルダ未選択</span>
+    </div>
+
+    <div class="head">
+      <div>
+        <div class="dateTitle" id="dateTitle">送迎表</div>
+        <div class="cal" id="cal"></div>
+      </div>
+      <div class="waves" id="waves"></div>
+      <div class="lunch" id="lunch"></div>
+    </div>
+    <div class="sumbar" id="sumbar"></div>
+
+    <div id="list"><div class="empty-note">「フォルダを開く」を押して <b>C:\shuttle</b> を選んでください。<br>送迎計画（view_日付.json）がある日がカレンダーに表示されます。</div></div>
+  </div>
+  <div class="right"><div id="map"></div><div id="mapMsg"></div></div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+// ====================================================================
+//  状態
+// ====================================================================
+const S = {
+  src: null,          // {type:'fs', root} | {type:'files', files:Map(path->File)}
+  dates: [],          // view_*.json がある日付
+  date: null,
+  calMonth: null,     // [year, month0]
+  V: null,            // view_<date>.json
+  idx: {},            // 地点ID → 行列の添字
+  names: {staff:{}, user:{}},
+  routes: [],         // {key, wave, staff, car, stops:[], anchor, rid}
+  original: null,     // 元の計画（routes_<date>.csv）
+  fromEdit: false,    // 修正版を読み込んだか
+  wave: 'ALL',
+  dirty: false,
+  undo: [],
+  hl: null,           // 地図で強調するルート key
+  sel: new Set(),     // 地図に表示する便（行をクリックで選択。空ならすべて表示）
+};
+let KEY = 1;
+const WD = ['日','月','火','水','木','金','土'];
+const COLORS = ['#e6194b','#3cb44b','#4363d8','#f58231','#911eb4','#42d4f4','#f032e6','#9a6324','#469990','#800000','#808000','#000075','#bfef45','#fabed4'];
+
+// ====================================================================
+//  ユーティリティ
+// ====================================================================
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const hm = m => (m < 0 ? '-' : '') + String(Math.floor(Math.abs(m) / 60)).padStart(2,'0') + ':' + String(Math.abs(m) % 60).padStart(2,'0');
+const hmShort = m => Math.floor(m / 60) + ':' + String(m % 60).padStart(2,'0');
+const toMin = s => { const [h, m] = String(s).trim().split(':').map(Number); return h * 60 + m; };
+let toastTimer;
+function toast(msg){ const t = $('toast'); t.textContent = msg; t.style.display = 'block'; clearTimeout(toastTimer); toastTimer = setTimeout(() => t.style.display = 'none', 2600); }
+
+function parseCSV(text){
+  text = text.replace(/^\uFEFF/, '');
+  const rows = []; let row = [], f = '', q = false;
+  for (let i = 0; i < text.length; i++){
+    const c = text[i];
+    if (q){
+      if (c === '"'){ if (text[i+1] === '"'){ f += '"'; i++; } else q = false; }
+      else f += c;
+    } else if (c === '"') q = true;
+    else if (c === ','){ row.push(f); f = ''; }
+    else if (c === '\n' || c === '\r'){
+      if (c === '\r' && text[i+1] === '\n') i++;
+      row.push(f); f = ''; if (row.some(x => x !== '')) rows.push(row); row = [];
+    } else f += c;
+  }
+  row.push(f); if (row.some(x => x !== '')) rows.push(row);
+  if (!rows.length) return [];
+  const h = rows[0].map(x => x.trim());
+  return rows.slice(1).map(r => Object.fromEntries(h.map((k, i) => [k, (r[i] ?? '').trim()])));
+}
+const csvCell = v => /[",\n\r]/.test(String(v)) ? '"' + String(v).replace(/"/g, '""') + '"' : String(v);
+const toCSV = (cols, rows) => '\uFEFF' + [cols.join(','), ...rows.map(r => cols.map(c => csvCell(r[c] ?? '')).join(','))].join('\r\n') + '\r\n';
+
+// ====================================================================
+//  ファイルの読み書き（File System Access API / フォルダ選択の予備）
+// ====================================================================
+async function getFileHandle(path, create){
+  const parts = path.split('/');
+  let d = S.src.root;
+  for (const p of parts.slice(0, -1)) d = await d.getDirectoryHandle(p, {create});
+  return d.getFileHandle(parts[parts.length - 1], {create});
+}
+async function readText(path){
+  try {
+    if (S.src.type === 'fs'){ const fh = await getFileHandle(path, false); return await (await fh.getFile()).text(); }
+    const f = S.src.files.get(path); return f ? await f.text() : null;
+  } catch(e){ return null; }
+}
+async function writeText(path, text){
+  if (S.src.type === 'fs'){
+    const fh = await getFileHandle(path, true);
+    const w = await fh.createWritable(); await w.write(text); await w.close();
+    return 'saved';
+  }
+  // 予備：ダウンロード
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], {type:'text/csv'}));
+  a.download = path.split('/').pop(); a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  return 'downloaded';
+}
+async function listDates(){
+  const re = /^view_(\d{4}-\d{2}-\d{2})\.json$/; const out = [];
+  if (S.src.type === 'fs'){
+    try {
+      const d = await (await S.src.root.getDirectoryHandle('output')).getDirectoryHandle('routing');
+      for await (const [name] of d.entries()){ const m = name.match(re); if (m) out.push(m[1]); }
+    } catch(e){}
+  } else {
+    for (const p of S.src.files.keys()){ const m = p.match(/^output\/routing\/view_(\d{4}-\d{2}-\d{2})\.json$/); if (m) out.push(m[1]); }
+  }
+  return out.sort();
+}
+
+// フォルダハンドルを IndexedDB に覚えておく（次回は「前回のフォルダを開く」で再利用）
+function idb(){ return new Promise((res, rej) => { const r = indexedDB.open('sougei-viewer', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+async function idbSet(k, v){ try { const db = await idb(); db.transaction('kv','readwrite').objectStore('kv').put(v, k); } catch(e){} }
+async function idbGet(k){ try { const db = await idb(); return await new Promise(res => { const r = db.transaction('kv').objectStore('kv').get(k); r.onsuccess = () => res(r.result); r.onerror = () => res(null); }); } catch(e){ return null; } }
+
+async function openFolder(){
+  if (S.dirty && !confirm('保存していない変更があります。破棄してフォルダを開きますか？')) return;
+  if (!window.showDirectoryPicker){ $('dirInput').click(); return; }   // 予備（読み込みのみ、保存はダウンロード）
+  try {
+    const root = await window.showDirectoryPicker({id:'shuttle', mode:'readwrite'});
+    await idbSet('root', root);
+    await useRoot(root);
+  } catch(e){ if (e.name !== 'AbortError') toast('フォルダを開けませんでした: ' + e.message); }
+}
+async function reopenFolder(){
+  const root = await idbGet('root'); if (!root) return openFolder();
+  try {
+    if (await root.requestPermission({mode:'readwrite'}) !== 'granted'){ toast('フォルダへのアクセスが許可されませんでした'); return; }
+    await useRoot(root);
+  } catch(e){ openFolder(); }
+}
+async function useRoot(root){
+  S.src = {type:'fs', root};
+  await afterOpen(root.name);
+}
+async function onDirInput(inp){
+  const files = new Map();
+  for (const f of inp.files){ const p = f.webkitRelativePath.split('/').slice(1).join('/'); files.set(p, f); }
+  S.src = {type:'files', files};
+  await afterOpen(inp.files[0]?.webkitRelativePath.split('/')[0] || '');
+  toast('読み込み専用モードです。保存するとファイルがダウンロードされます');
+}
+async function afterOpen(name){
+  S.names = {staff:{}, user:{}};
+  const nt = await readText('data/real/names.csv');
+  if (nt) for (const r of parseCSV(nt)){ if (S.names[r.kind]) S.names[r.kind][r.id] = r.name; }
+  S.dates = await listDates();
+  $('bReopen').style.display = 'none';
+  if (!S.dates.length){
+    $('list').innerHTML = `<div class="empty-note">「${esc(name)}」の output\\routing に view_日付.json がありません。<br>C:\\shuttle を選んでいるか、run_routing.bat を実行済みか確認してください。</div>`;
+    setStatus(); renderCal(); return;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  await loadDate(S.dates.find(d => d >= today) || S.dates[S.dates.length - 1]);
+  setStatus(nt ? '' : '氏名の名簿（data\\real\\names.csv）がないため ID で表示しています');
+}
+
+// ====================================================================
+//  日付の読み込み
+// ====================================================================
+async function loadDate(date){
+  if (S.dirty && !confirm('保存していない変更があります。破棄して日付を切り替えますか？')) return;
+  const vt = await readText(`output/routing/view_${date}.json`);
+  if (!vt){ toast(`view_${date}.json が読めません`); return; }
+  S.V = JSON.parse(vt); S.date = date;
+  S.idx = Object.fromEntries(S.V.matrix.ids.map((id, i) => [id, i]));
+  S.W = Object.fromEntries(S.V.waves.map(w => [w.id, w]));
+  S.ST = Object.fromEntries(S.V.staff.map(s => [s.id, s]));
+  S.CR = Object.fromEntries(S.V.cars.map(c => [c.id, c]));
+  S.ngSet = new Set(S.V.ng_pairs.map(p => p.join('|')));
+
+  const orig = await readText(`output/routing/routes_${date}.csv`);
+  const edit = await readText(`output/routing/routes_${date}_edit.csv`);
+  S.original = orig ? routesFromCSV(orig) : [];
+  S.fromEdit = !!edit;
+  S.routes = edit ? routesFromCSV(edit) : clone(S.original);
+  S.routes.sort((a, b) => calc(a).start - calc(b).start);   // 施設を出る時刻の順
+  S.undo = []; S.dirty = false; S.wave = 'ALL'; S.hl = null; S.sel.clear();
+  const d = new Date(date + 'T00:00:00'); S.calMonth = [d.getFullYear(), d.getMonth()];
+  render(true);
+  if (!orig && !edit) toast('この日は計画（routes CSV）がありません。「＋便を追加」で手で組めます');
+}
+function routesFromCSV(text){
+  const out = [];
+  const split = t => (t || '').split('→').map(s => s.trim()).filter(Boolean);
+  for (const r of parseCSV(text)){
+    const dep = toMin(r['施設出発'] || r['出発時刻']), arr = toMin(r['施設帰着'] || r['到着時刻']);
+    const waves = (r['便'] || '').split('→');
+    if (waves.length === 2 && S.W[waves[0]] && S.W[waves[1]]){
+      // 連結ルート（送り→施設に戻らず迎え）: 送りの便と迎えの便に分けて、link でつなぐ
+      const [a, b] = (r['順路'] || '').split('⇒');
+      const link = 'L' + KEY;
+      out.push({key: KEY++, rid: r.route_id, wave: waves[0], staff: r['職員'], car: r['車'], stops: split(a), anchor: dep, link, role: 'drop'});
+      out.push({key: KEY++, rid: r.route_id, wave: waves[1], staff: r['職員'], car: r['車'], stops: split(b), anchor: arr, link, role: 'pick'});
+      continue;
+    }
+    const w = S.W[r['便']];
+    if (!w) continue;
+    out.push({key: KEY++, rid: r.route_id, wave: w.id, staff: r['職員'], car: r['車'], stops: split(r['順路']),
+              anchor: w.kind === 'pickup' ? arr : dep});
+  }
+  return out;
+}
+// 連結ルートの相手（送りなら続きの迎え、迎えなら前の送り）。両方に利用者がいるときだけ連結として扱う
+function partner(r){
+  if (!r.link) return null;
+  const p = S.routes.find(x => x.link === r.link && x.key !== r.key);
+  return p && p.stops.length && r.stops.length ? p : null;
+}
+const clone = rs => rs.map(r => ({...r, key: KEY++, stops: [...r.stops]}));
+
+// ====================================================================
+//  計算（validate.py と同じルール）
+// ====================================================================
+const mins = (a, b) => a === b ? 0 : S.V.matrix.minutes[S.idx[a]][S.idx[b]];
+function calc(r){
+  const w = S.W[r.wave], U = S.V.users, pt = partner(r);
+  const from = pt && r.role === 'pick' ? pt.stops[pt.stops.length - 1] : 'DEPOT';
+  const toDepot = !(pt && r.role === 'drop');
+  let drive = 0, svc = 0, prev = from;
+  const legs = [];
+  for (const u of r.stops){ const m = mins(prev, u); legs.push(m); drive += m; svc += U[u].service_min; prev = u; }
+  const back = r.stops.length && toDepot ? mins(prev, 'DEPOT') : 0; drive += back;
+  const total = drive + svc;
+  const start = w.kind === 'pickup' ? r.anchor - total : r.anchor;
+  const end = start + total;
+  const eta = [], etd = []; let t = start;
+  r.stops.forEach((u, i) => { t += legs[i]; eta.push(t); t += U[u].service_min; etd.push(t); });
+  return {start, end, eta, etd, drive, from, toDepot};
+}
+function validateAll(){
+  const C = S.V.config, U = S.V.users;
+  const owners = new Set(S.V.cars.filter(c => c.owner).map(c => c.owner));
+  const res = {}; const busy = {};
+  for (const r of S.routes){
+    const m = []; const k = calc(r); res[r.key] = {calc: k, msgs: m, ngUsers: new Set()};
+    const w = S.W[r.wave], s = S.ST[r.staff], c = S.CR[r.car], us = r.stops.map(u => U[u]);
+    if (!r.stops.length) m.push('利用者がいません（不要なら削除してください）');
+    if (!s) m.push(`職員 ${r.staff || '未選択'} は当日の出勤者にいません`);
+    if (!c) m.push(`車 ${r.car || '未選択'} は当日使えません`);
+    if (c){
+      const seats = us.reduce((a, u) => a + u.seats, 0);
+      if (seats > c.capacity) m.push(`定員超過（${seats}人 / ${c.capacity}人）`);
+      const wk = us.reduce((a, u) => a + u.walker, 0);
+      if (wk > c.walker_slots) m.push(`歩行器の積載超過（${wk} / ${c.walker_slots}）`);
+      const wc = us.reduce((a, u) => a + u.wheelchair, 0);
+      if (wc > c.wheelchair_slots) m.push(`車椅子の積載超過（${wc} / ${c.wheelchair_slots}）`);
+      if (c.owner && c.owner !== r.staff) m.push(`${c.id} は ${staffName(c.owner)} の所有車です`);
+    }
+    if (s){
+      const need = Math.max(0, ...us.map(u => u.care_need));
+      if (need > s.care_skill) m.push(`介助スキル不足（必要 ${need} / ${staffName(s.id)} ${s.care_skill}）`);
+      if (owners.has(s.id) && (!c || c.owner !== s.id)) m.push(`${staffName(s.id)} は自分の車以外を運転しています`);
+      if (r.stops.length && !(s.start <= k.start && k.end <= (s.max_end ?? s.end))) m.push(`勤務時間外（${hm(s.start)}〜${hm(s.max_end ?? s.end)}${(s.max_end ?? s.end) > s.end ? '・残業込み' : ''}）`);
+    }
+    for (let i = 0; i < r.stops.length; i++) for (let j = i + 1; j < r.stops.length; j++){
+      const a = r.stops[i], b = r.stops[j];
+      if (S.ngSet.has([a, b].sort().join('|'))){ m.push(`同乗NG：${userName(a)} と ${userName(b)}`); res[r.key].ngUsers.add(a).add(b); }
+    }
+    if (r.stops.length){
+      if (w.kind === 'pickup' && !(w.time - C.early_eps <= k.end && k.end <= w.time)) m.push(`施設着 ${hm(k.end)} が時間外（${hm(w.time - C.early_eps)}〜${hm(w.time)}）`);
+      if (w.kind === 'dropoff' && !(w.time <= k.start && k.start <= w.time + C.late_eps)) m.push(`施設発 ${hm(k.start)} が時間外（${hm(w.time)}〜${hm(w.time + C.late_eps)}）`);
+      if (k.end - k.start > C.max_route_min) m.push(`所要 ${k.end - k.start} 分が上限 ${C.max_route_min} 分を超えています`);
+      const pt = partner(r);
+      if (pt && r.role === 'drop'){
+        const kp = calc(pt), wait = kp.start - k.end;
+        if (wait < 0) m.push(`続きの迎えに間に合いません（送り終わり ${hm(k.end)} ／ 迎えへの出発 ${hm(kp.start)}）`);
+        else if (wait > C.chain_max_wait) m.push(`空車での待機 ${wait} 分が上限 ${C.chain_max_wait} 分を超えています`);
+        if (pt.staff !== r.staff || pt.car !== r.car) m.push('続けて回る送りと迎えは、同じ職員・同じ車にしてください');
+        for (const [kind, id] of [['職員', r.staff], ['車', r.car]]){ (busy[kind + id] ??= []).push({s: k.start, e: kp.end, key: r.key, kind, id}); }
+      } else if (!(pt && r.role === 'pick')){
+        for (const [kind, id] of [['職員', r.staff], ['車', r.car]]){ (busy[kind + id] ??= []).push({s: k.start, e: k.end, key: r.key, kind, id}); }
+      }
+    }
+  }
+  for (const iv of Object.values(busy)){
+    iv.sort((a, b) => a.s - b.s);
+    for (let i = 1; i < iv.length; i++){
+      const p = iv[i-1], q = iv[i];
+      if (p.e + C.turnaround_min > q.s){
+        const label = p.kind === '職員' ? staffName(p.id) : p.id;
+        const wq = waveLabel(S.W[S.routes.find(r => r.key === q.key).wave]);
+        const wp = waveLabel(S.W[S.routes.find(r => r.key === p.key).wave]);
+        res[p.key].msgs.push(`${p.kind} ${label} の時間が重なっています（${wq} の便と。準備${C.turnaround_min}分込み）`);
+        res[q.key].msgs.push(`${q.kind} ${label} の時間が重なっています（${wp} の便と。準備${C.turnaround_min}分込み）`);
+      }
+    }
+  }
+  return res;
+}
+function unassigned(waveId){
+  const w = S.W[waveId]; const used = new Set(S.routes.filter(r => r.wave === waveId).flatMap(r => r.stops));
+  return w.users.filter(u => !used.has(u));
+}
+
+// ====================================================================
+//  表示名
+// ====================================================================
+function staffName(id){ return S.names.staff[id] || S.names.staff[String(id).replace(/^S/, '')] || id; }
+function userName(id){ return S.names.user[id] || id; }
+function waveLabel(w){ return (w.kind === 'pickup' ? '迎え ' : 'お帰り ') + hmShort(w.time); }
+function showId(){ return $('chkId').checked; }
+
+// ====================================================================
+//  描画
+// ====================================================================
+// ====================================================================
+//  昼休み（lunch.py と同じ方法）
+//  対象: 勤務時間が昼休みの時間帯をすべて含む職員。時間帯の中で、送迎していない連続時間のうち
+//  最も長いものを選び、最大 lunch_max 分にする。lunch_min 分に満たなければ「取れません」。
+//  送迎している時間 = 施設を出てから戻るまで＋準備時間。連結（送り→迎え）の空車待機は休憩に使える。
+// ====================================================================
+function lunchPlan(V){
+  const C = S.V.config, L = S.V.lunch || {start: 690, end: 810};
+  const ws = L.start, we = L.end, lmin = C.lunch_min ?? 30, lmax = C.lunch_max ?? 60, turn = C.turnaround_min ?? 10;
+  const enabled = !(C.lunch_enabled === false || C.lunch_enabled === 0);
+  const out = [];
+  for (const s of S.V.staff.slice().sort((a, b) => String(a.id).localeCompare(String(b.id)))){
+    if (!enabled || !(s.start <= ws && s.end >= we)){ out.push({s, off: true}); continue; }
+    const busy = [], waits = [];
+    for (const r of S.routes){
+      if (r.staff !== s.id || !r.stops.length) continue;
+      const k = V[r.key].calc, pt = partner(r);
+      if (pt && r.role === 'pick') continue;            // 連結の迎えは送りの側でまとめて扱う
+      if (pt && r.role === 'drop'){
+        const kp = V[pt.key].calc;
+        const a = k.end + mins(r.stops[r.stops.length - 1], pt.stops[0]);   // 迎えの1軒目に着く時刻（ここから空車待機）
+        const b = kp.eta[0];                                                 // 迎えの1人目を乗せる時刻
+        busy.push([k.start, a], [b, kp.end + turn]); waits.push([a, b]);
+      } else busy.push([k.start, k.end + turn]);
+    }
+    busy.sort((x, y) => x[0] - y[0]);
+    let best = null, t = ws;
+    for (let [a, b] of busy.concat([[we, we]])){
+      a = Math.min(Math.max(a, ws), we); b = Math.max(Math.min(b, we), ws);
+      if (a > t && (!best || a - t > best[1] - best[0])) best = [t, a];
+      t = Math.max(t, b);
+    }
+    if (!best || best[1] - best[0] < lmin){ out.push({s, ng: true}); continue; }
+    const e = Math.min(best[1], best[0] + lmax);
+    out.push({s, b: best[0], e, inCar: waits.some(([a, b]) => best[0] < b && a < e)});
+  }
+  return {ws, we, lmin, rows: out};
+}
+function renderLunch(lp){
+  const nm = id => esc(staffName(id)) + (showId() && staffName(id) !== id ? `<small>${esc(id)}</small>` : '');
+  const rows = lp.rows.map(x => `<tr><td>${nm(x.s.id)}</td><td>${
+    x.off ? `<span class="off">対象外（${hmShort(x.s.start)}〜${hmShort(x.s.end)}勤務）</span>`
+    : x.ng ? `<span class="ng">取れません</span>`
+    : `${hmShort(x.b)}〜${hmShort(x.e)}（${x.e - x.b}分）${x.inCar ? '<span class="car" title="送りのあと施設に戻らず、空車で待つ間に休憩">車内</span>' : ''}`}</td></tr>`).join('');
+  $('lunch').innerHTML = `<h4>昼休み<small>${hmShort(lp.ws)}〜${hmShort(lp.we)}の間に${lp.lmin}分以上</small></h4><table>${rows}</table>`;
+}
+
+function render(fit){
+  if (!S.V){ renderCal(); return; }
+  const d = new Date(S.date + 'T00:00:00');
+  $('dateTitle').innerHTML = `${d.getFullYear()}年${d.getMonth()+1}月${d.getDate()}日（${WD[d.getDay()]}）` + (S.fromEdit ? ' <span class="badge-edit">修正版</span>' : '');
+  renderCal(); renderWaves();
+  const V = validateAll();
+  S.lastV = V;
+  const colorOf = {}; S.routes.forEach((r, i) => colorOf[r.key] = COLORS[i % COLORS.length]);
+  S.colorOf = colorOf;
+
+  const waves = S.V.waves.filter(w => S.wave === 'ALL' || w.id === S.wave);
+  let h = '';
+  for (const w of waves){
+    const rs = S.routes.filter(r => r.wave === w.id);   // 並び順は読み込み時のまま（編集しても行が動かないように）
+    const un = unassigned(w.id);
+    const cls = w.kind === 'pickup' ? 'pick' : 'drop';
+    h += `<div class="group"><h3><span class="tag ${cls}">${waveLabel(w)}</span><span class="cnt">${w.plan_id ? 'プラン' + esc(w.plan_id) + '・' : ''}利用者 ${w.users.length}名・${rs.length}便</span>
+          <button onclick="addRoute('${esc(w.id)}')">＋便を追加</button></h3>`;
+    for (const r of rs) h += rowHTML(r, w, V[r.key], colorOf[r.key]);
+    h += `<div class="pool ${un.length ? '' : 'empty'}" data-wave="${esc(w.id)}" ondragover="dzOver(event,this)" ondragleave="dzLeave(this)" ondrop="dzDrop(event,'POOL','${esc(w.id)}')">
+            <div class="plbl">${un.length ? `未割当 ${un.length}名` : '未割当なし'}</div>
+            <div class="chips">${un.map(u => chipHTML(u, 'POOL', w.id, null)).join('') || '<span style="font-size:12px;color:var(--sub)">ここへドラッグすると便から外せます</span>'}</div></div>`;
+    h += '</div>';
+  }
+  $('list').innerHTML = h || '<div class="empty-note">便がありません</div>';
+
+  const lp = lunchPlan(V);
+  renderLunch(lp);
+  const nLunchNg = lp.rows.filter(x => x.ng).length;
+  const nBad = Object.values(V).reduce((a, x) => a + x.msgs.length, 0) + nLunchNg;   // 昼休みが取れない職員も要確認に含める
+  const nUn = S.V.waves.reduce((a, w) => a + unassigned(w.id).length, 0);
+  const drive = Object.values(V).reduce((a, x) => a + x.calc.drive, 0);
+  $('sumbar').innerHTML = `便 <b>${S.routes.length}</b>　総走行 <b>${drive}</b> 分　` +
+    `<span class="${nUn ? 'bad' : ''}">未割当 <b>${nUn}</b> 名</span>　<span class="${nBad ? 'bad' : ''}">要確認 <b>${nBad}</b> 件</span>` +
+    (nLunchNg ? `<span class="bad">（うち昼休みが取れない職員 ${nLunchNg} 名）</span>` : '');
+  $('bUndo').disabled = !S.undo.length; $('bSave').disabled = !S.dirty; $('bReset').disabled = !(S.dirty || S.fromEdit);
+  setStatus();
+  renderMap(fit);
+}
+
+function rowHTML(r, w, v, color){
+  const k = v.calc, pick = w.kind === 'pickup';
+  const staffOpts = ['<option value="">職員を選択</option>'].concat(S.V.staff.slice().sort((a, b) => a.id.localeCompare(b.id))
+    .map(s => `<option value="${esc(s.id)}" ${s.id === r.staff ? 'selected' : ''}>${esc(staffName(s.id))}${showId() ? ' ' + esc(s.id) : ''}</option>`));
+  if (r.staff && !S.ST[r.staff]) staffOpts.push(`<option selected>${esc(staffName(r.staff))}（出勤なし）</option>`);
+  const carOpts = ['<option value="">車を選択</option>'].concat(S.V.cars.map(c =>
+    `<option value="${esc(c.id)}" ${c.id === r.car ? 'selected' : ''}>${esc(c.id)}（${c.capacity}人${c.walker_slots ? '・歩' + c.walker_slots : ''}${c.wheelchair_slots ? '・車椅' + c.wheelchair_slots : ''}${c.help ? '・ヘルプ' : ''}）</option>`));
+  if (r.car && !S.CR[r.car]) carOpts.push(`<option selected>${esc(r.car)}（使用不可）</option>`);
+  const chips = r.stops.map((u, i) => (i ? '<span class="arrow">▶</span>' : '') + chipHTML(u, r.key, w.id, {eta: k.eta[i], etd: k.etd[i], ng: v.ngUsers.has(u)})).join('');
+  const pt = partner(r);
+  const url = gmapUrl(r.stops, true, k.from, k.toDepot ? 'DEPOT' : null);
+  let chainTag = '', endTxt = `▶ 施設 ${hmShort(k.end)}着`;
+  if (pt && r.role === 'drop'){
+    endTxt = `▶ 施設に戻らず ${esc(waveLabel(S.W[pt.wave]))} へ`;
+  } else if (pt && r.role === 'pick'){
+    const wait = k.start - calc(pt).end;
+    chainTag = `<span class="endt chain">${esc(waveLabel(S.W[pt.wave]))} の続き（空車待機 ${wait} 分）▶</span>`;
+  }
+  return `<div class="row ${S.hl === r.key ? 'hl' : ''} ${S.sel.has(r.key) ? 'sel' : ''}" data-key="${r.key}" style="border-left-color:${color}"
+    onclick="rowClick(event,${r.key})" title="クリックでこの便だけ地図に表示（Ctrl+クリックで複数選択）" onmouseenter="hlRoute(${r.key})" onmouseleave="hlRoute(null)">
+    <div class="who"><select onchange="setField(${r.key},'staff',this.value)">${staffOpts.join('')}</select>
+      <select onchange="setField(${r.key},'car',this.value)">${carOpts.join('')}</select></div>
+    <div class="tm">${pick
+        ? `<b>${hmShort(k.start)}発</b><div class="lbl">施設着</div><input type="time" value="${hm(r.anchor)}" onchange="setAnchor(${r.key},this.value)">`
+        : `<div class="lbl">施設発</div><input type="time" value="${hm(r.anchor)}" onchange="setAnchor(${r.key},this.value)">`}</div>
+    <div class="chips" ondragover="dzOver(event,this)" ondragleave="dzLeave(this)" ondrop="dzDrop(event,${r.key},'${esc(w.id)}')">${chainTag}${chips}
+      ${r.stops.length ? `<span class="endt${pt && r.role === 'drop' ? ' chain' : ''}">${endTxt}</span>` : '<span style="font-size:12px;color:var(--sub)">利用者をここへドラッグ</span>'}</div>
+    <div class="ops">${url ? `<a href="${esc(url)}" target="_blank" rel="noopener" title="Googleマップで経路を確認">地図</a>` : ''}
+      <button class="del" onclick="delRoute(${r.key})" title="この便を削除（利用者は未割当へ）">削除</button></div>
+  </div>` + (v.msgs.length ? `<div class="msgs">${v.msgs.map(m => `<div>${esc(m)}</div>`).join('')}</div>` : '');
+}
+function chipHTML(u, key, waveId, t){
+  const U = S.V.users[u];
+  const icons = (U.walker ? '歩' : '') + (U.wheelchair ? '車' : '') + (U.care_need >= 2 ? '介' + U.care_need : '');
+  return `<div class="chip ${t && t.ng ? 'ng' : ''}" draggable="true" data-u="${esc(u)}" data-key="${key}" data-wave="${esc(waveId)}"
+      ondragstart="dStart(event)" ondragend="dEnd(event)" ondragover="chipOver(event)" ondragleave="chipLeave(event)" onclick="focusUser('${esc(u)}')">
+    <div class="nm">${esc(userName(u))}${S.names.user[u] ? 'さん' : ''}${showId() && S.names.user[u] ? `<small>${esc(u)}</small>` : ''}${icons ? `<span class="ic" title="歩=歩行器 車=車椅子 介=介助量">${icons}</span>` : ''}</div>
+    ${t ? `<div class="t">${hmShort(t.eta)}着 → ${hmShort(t.etd)}発</div>` : ''}</div>`;
+}
+
+function renderWaves(){
+  const b = [`<button class="wbtn all ${S.wave === 'ALL' ? 'on' : ''}" onclick="setWave('ALL')">すべての便</button>`];
+  const picks = S.V.waves.filter(w => w.kind === 'pickup'), drops = S.V.waves.filter(w => w.kind === 'dropoff');
+  for (let i = 0; i < Math.max(picks.length, drops.length); i++){
+    for (const w of [picks[i], drops[i]]){
+      if (!w){ b.push('<span></span>'); continue; }
+      const n = S.routes.filter(r => r.wave === w.id).length, un = unassigned(w.id).length;
+      b.push(`<button class="wbtn ${w.kind === 'pickup' ? 'pick' : 'drop'} ${S.wave === w.id ? 'on' : ''}" onclick="setWave('${esc(w.id)}')">${waveLabel(w)}<small>${w.plan_id ? esc(w.plan_id) + '・' : ''}${w.users.length}名・${n}便${un ? '・未割当' + un : ''}</small></button>`);
+    }
+  }
+  $('waves').innerHTML = b.join('');
+}
+function setWave(id){ S.wave = id; S.hl = null; S.sel.clear(); render(true); }
+
+function renderCal(){
+  if (!S.calMonth){ const n = new Date(); S.calMonth = [n.getFullYear(), n.getMonth()]; }
+  const [y, m] = S.calMonth, first = new Date(y, m, 1).getDay(), days = new Date(y, m + 1, 0).getDate();
+  const has = new Set(S.dates);
+  let h = `<div class="ch"><button onclick="calMove(-1)">◀</button><span>${y}年${m+1}月</span><button onclick="calMove(1)">▶</button></div><table><tr>${WD.map(x => `<th>${x}</th>`).join('')}</tr><tr>`;
+  for (let i = 0; i < first; i++) h += '<td></td>';
+  for (let d = 1; d <= days; d++){
+    const ds = `${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`, w = (first + d - 1) % 7;
+    const c = [has.has(ds) ? 'has' : '', ds === S.date ? 'sel' : '', w === 0 ? 'sun' : w === 6 ? 'sat' : ''].join(' ');
+    h += `<td class="${c}" ${has.has(ds) ? `onclick="loadDate('${ds}')"` : ''}>${d}</td>`;
+    if (w === 6 && d < days) h += '</tr><tr>';
+  }
+  $('cal').innerHTML = h + '</tr></table>';
+}
+function calMove(n){ let [y, m] = S.calMonth; m += n; if (m < 0){ m = 11; y--; } if (m > 11){ m = 0; y++; } S.calMonth = [y, m]; renderCal(); }
+
+function setStatus(extra){
+  const st = $('status');
+  if (!S.src){ st.textContent = 'フォルダ未選択'; st.className = 'status'; return; }
+  st.className = 'status' + (S.dirty ? ' dirty' : '');
+  st.textContent = S.dirty ? '未保存の変更があります' : (extra || (S.src.type === 'fs' ? '保存済み' : '読み込み専用（保存はダウンロード）'));
+}
+
+// ====================================================================
+//  編集
+// ====================================================================
+function snapshot(){ S.undo.push(JSON.stringify(S.routes)); if (S.undo.length > 100) S.undo.shift(); S.dirty = true; }
+function undo(){
+  if (!S.undo.length) return;
+  S.routes = JSON.parse(S.undo.pop()); S.dirty = S.undo.length > 0 || S.dirty; render();
+}
+function find(key){ return S.routes.find(r => r.key === key); }
+function setField(key, f, v){
+  snapshot(); const r = find(key); r[f] = v;
+  if (r.link && (f === 'staff' || f === 'car')) S.routes.filter(x => x.link === r.link).forEach(x => x[f] = v);   // 連結の相手も同じ職員・車
+  render();
+}
+function setAnchor(key, v){ if (!v) return; snapshot(); find(key).anchor = toMin(v); render(); }
+function addRoute(waveId){
+  snapshot(); const w = S.W[waveId];
+  S.routes.push({key: KEY++, rid: '', wave: waveId, staff: '', car: '', stops: [], anchor: w.time});
+  S.wave = waveId; render(); toast('便を追加しました。職員・車を選び、利用者をドラッグしてください');
+}
+function delRoute(key){
+  const r = find(key);
+  if (r.stops.length && !confirm(`この便を削除します。乗っている ${r.stops.length} 名は「未割当」に戻ります。よろしいですか？`)) return;
+  snapshot(); S.routes = S.routes.filter(x => x.key !== key); S.sel.delete(key);
+  if (r.link) S.routes.filter(x => x.link === r.link).forEach(x => { delete x.link; delete x.role; });   // 相手は通常の便に戻す
+  render(true);
+}
+function resetToOriginal(){
+  if (!confirm('ソルバーが作った元の計画に戻します（保存するまでファイルは変わりません）。よろしいですか？')) return;
+  snapshot(); S.routes = clone(S.original); S.routes.sort((a, b) => calc(a).start - calc(b).start); S.fromEdit = false; S.sel.clear(); render(true);
+}
+
+// --- ドラッグ＆ドロップ ---
+let drag = null;
+function dStart(e){
+  const c = e.currentTarget; drag = {u: c.dataset.u, key: c.dataset.key === 'POOL' ? 'POOL' : Number(c.dataset.key), wave: c.dataset.wave};
+  e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', drag.u);
+  setTimeout(() => c.classList.add('dragging'), 0);
+}
+function dEnd(e){ e.currentTarget.classList.remove('dragging'); document.querySelectorAll('.over,.ins-l,.ins-r').forEach(x => x.classList.remove('over','ins-l','ins-r')); drag = null; }
+function chipOver(e){
+  if (!drag) return;
+  const c = e.currentTarget, r = c.getBoundingClientRect(), left = e.clientX < r.left + r.width / 2;
+  c.classList.toggle('ins-l', left); c.classList.toggle('ins-r', !left);
+}
+function chipLeave(e){ e.currentTarget.classList.remove('ins-l','ins-r'); }
+function dzOver(e, el){ if (!drag) return; e.preventDefault(); el.classList.add('over'); }
+function dzLeave(el){ el.classList.remove('over'); }
+function dzDrop(e, toKey, waveId){
+  e.preventDefault(); e.stopPropagation();
+  if (!drag) return;
+  if (drag.wave !== waveId){ toast('利用者は同じ便（同じ時間帯）の中でだけ移動できます'); dEnd({currentTarget: document.body}); return; }
+  // 挿入位置：ドロップした場所のチップ
+  const chip = e.target.closest('.chip');
+  let pos = null;
+  if (chip && chip.dataset.key == String(toKey)){
+    const r = chip.getBoundingClientRect(), left = e.clientX < r.left + r.width / 2;
+    const to = toKey === 'POOL' ? null : find(toKey);
+    if (to){ pos = to.stops.indexOf(chip.dataset.u) + (left ? 0 : 1); }
+  }
+  moveUser(drag.u, drag.key, toKey, pos);
+  document.querySelectorAll('.over,.ins-l,.ins-r').forEach(x => x.classList.remove('over','ins-l','ins-r'));
+  drag = null;
+}
+function moveUser(u, fromKey, toKey, pos){
+  if (fromKey === toKey && toKey === 'POOL') return;
+  snapshot();
+  let fromIdx = -1;
+  if (fromKey !== 'POOL'){ const f = find(fromKey); fromIdx = f.stops.indexOf(u); f.stops.splice(fromIdx, 1); }
+  if (toKey !== 'POOL'){
+    const t = find(toKey);
+    if (pos == null) pos = t.stops.length;
+    else if (fromKey === toKey && fromIdx < pos) pos--;
+    t.stops.splice(pos, 0, u);
+  }
+  render();
+}
+
+// ====================================================================
+//  地図（国土地理院 地理院タイル / Leaflet）
+// ====================================================================
+let map = null, mapLayer = null, markers = {};
+function initMap(){
+  if (map) return true;
+  if (!window.L){
+    $('mapMsg').style.display = 'flex';
+    $('mapMsg').textContent = '地図を読み込めませんでした（インターネット接続を確認してください）。表の編集・保存は使えます。';
+    return false;
+  }
+  map = L.map('map', {zoomControl: true, maxZoom: 18, zoomSnap: 0.25, zoomDelta: 0.5});   // 細かい倍率で、全ルートがちょうど収まるように
+  // 背景地図：国土地理院の地理院タイル（file:// で開いても表示できる。登録・費用不要）
+  const gsi = (id, ext) => L.tileLayer(`https://cyberjapandata.gsi.go.jp/xyz/${id}/{z}/{x}/{y}.${ext}`,
+    {maxZoom: 18, attribution: '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank">地理院タイル</a>'});
+  const base = {'淡色地図': gsi('pale', 'png'), '標準地図': gsi('std', 'png'), '航空写真': gsi('seamlessphoto', 'jpg')};
+  base['淡色地図'].addTo(map);
+  L.control.layers(base, null, {position: 'topright'}).addTo(map);
+  mapLayer = L.layerGroup().addTo(map);
+  // 左上：選択中の便の表示と「全体表示」ボタン
+  const Sel = L.Control.extend({onAdd(){
+    const d = L.DomUtil.create('div', 'mapsel'); d.id = 'mapSel';
+    L.DomEvent.disableClickPropagation(d);
+    return d;
+  }});
+  new Sel({position: 'topleft'}).addTo(map);
+  // 全体表示ボタン（常時）
+  const All = L.Control.extend({onAdd(){
+    const b = L.DomUtil.create('button', 'mapsel'); b.style.display = 'flex'; b.textContent = '全体表示'; b.title = '選択を解除して全ルートが収まる範囲に戻す';
+    L.DomEvent.disableClickPropagation(b); L.DomEvent.on(b, 'click', clearSel);
+    return b;
+  }});
+  new All({position: 'topright'}).addTo(map);
+  return true;
+}
+function renderMap(fit){
+  if (!S.V || !initMap()) return;
+  mapLayer.clearLayers(); markers = {};
+  const fac = S.V.facility, U = S.V.users, pts = [fac];
+  L.marker(fac, {icon: L.divIcon({className: 'home-icon', html: '🏠', iconSize: [24, 24]}), zIndexOffset: 1000}).bindTooltip('施設').addTo(mapLayer);
+  for (const k of [...S.sel]) if (!S.routes.some(r => r.key === k)) S.sel.delete(k);   // 削除・元に戻すで無くなった便
+  const selMode = S.sel.size > 0;
+  const rs = S.routes.filter(r => (S.wave === 'ALL' || r.wave === S.wave) && (!selMode || S.sel.has(r.key)));
+  for (const r of rs){
+    if (!r.stops.length) continue;
+    const col = S.colorOf[r.key], dim = S.hl != null && S.hl !== r.key && rs.some(x => x.key === S.hl);   // 表示中の便どうしでだけ強調
+    const ll = r.stops.map(u => [U[u].lat, U[u].lng]);
+    const k = S.lastV[r.key].calc;
+    const p0 = k.from === 'DEPOT' ? fac : [U[k.from].lat, U[k.from].lng];
+    L.polyline([p0, ...ll, ...(k.toDepot ? [fac] : [])], {color: col, weight: dim ? 2 : 4, opacity: dim ? .25 : .85,
+      dashArray: k.from === 'DEPOT' ? null : '6 6'}).on('click', e => selectRoute(r.key, e.originalEvent.ctrlKey || e.originalEvent.metaKey)).addTo(mapLayer);
+    if (k.from !== 'DEPOT') pts.push(p0);
+    r.stops.forEach((u, i) => {
+      const m = L.marker(ll[i], {opacity: dim ? .35 : 1, zIndexOffset: dim ? 0 : 500, icon: L.divIcon({className: '', iconSize: [22, 22],
+        html: `<div class="num-icon" style="background:${col}">${i + 1}</div>`})})
+        .bindTooltip(`${esc(userName(u))}${S.names.user[u] ? 'さん' : ''}<br>${esc(waveLabel(S.W[r.wave]))}・${esc(staffName(r.staff))}・${esc(r.car)}<br>${hmShort(k.eta[i])}着 → ${hmShort(k.etd[i])}発`)
+        .on('click', e => selectRoute(r.key, e.originalEvent.ctrlKey || e.originalEvent.metaKey))
+        .addTo(mapLayer);
+      markers[u + '|' + r.wave] = m; pts.push(ll[i]);
+    });
+  }
+  // 未割当（表示中の便のみ。便を選択中は出さない）
+  for (const w of S.V.waves.filter(w => !selMode && (S.wave === 'ALL' || w.id === S.wave))){
+    for (const u of unassigned(w.id)){
+      const m = L.circleMarker([U[u].lat, U[u].lng], {radius: 7, color: '#d1242f', weight: 2, fillColor: '#fff', fillOpacity: 1})
+        .bindTooltip(`未割当：${esc(userName(u))}（${esc(waveLabel(w))}）`).addTo(mapLayer);
+      markers[u + '|' + w.id] = m; pts.push([U[u].lat, U[u].lng]);
+    }
+  }
+  const box = $('mapSel');
+  if (box){
+    box.style.display = selMode ? 'flex' : 'none';
+    box.innerHTML = selMode ? `選択中 <b>${S.sel.size}</b> 便<button onclick="clearSel()">解除</button>` : '';
+  }
+  if (fit) fitTo(pts);
+}
+function fitTo(pts){
+  map.invalidateSize();   // 画面サイズが変わっていても正しく収める
+  if (pts.length > 1) map.fitBounds(L.latLngBounds(pts), {padding: [36, 36], maxZoom: 16});
+  else map.setView(pts[0], 15);
+}
+// 便の選択（行・地図上の線/番号をクリック）。Ctrl+クリックで追加・解除
+function selectRoute(key, multi){
+  if (multi){ S.sel.has(key) ? S.sel.delete(key) : S.sel.add(key); }
+  else if (S.sel.size === 1 && S.sel.has(key)) S.sel.clear();      // 選択中の便をもう一度クリック → 解除
+  else { S.sel.clear(); S.sel.add(key); }
+  document.querySelectorAll('.row[data-key]').forEach(x => x.classList.toggle('sel', S.sel.has(+x.dataset.key)));
+  S.hl = null;
+  renderMap(true);
+}
+function clearSel(){
+  S.sel.clear(); S.hl = null;
+  document.querySelectorAll('.row.sel').forEach(x => x.classList.remove('sel'));
+  renderMap(true);
+}
+function rowClick(e, key){
+  if (e.target.closest('select,input,button,a,.chip')) return;   // 職員・車の選択や利用者の操作はそのまま
+  selectRoute(key, e.ctrlKey || e.metaKey);
+}
+function hlRoute(key){
+  if (S.hl === key) return;
+  S.hl = key;
+  document.querySelectorAll('.row').forEach(x => x.classList.remove('hl'));
+  renderMap(false);
+}
+function focusUser(u){
+  if (!map) return;
+  const m = Object.entries(markers).find(([k]) => k.startsWith(u + '|') && (S.wave === 'ALL' || k.endsWith('|' + S.wave)));
+  if (m){ map.panTo(m[1].getLatLng()); m[1].openTooltip(); }
+}
+
+// ====================================================================
+//  Googleマップ URL（maps.py と同じ形式）
+// ====================================================================
+const ll6 = p => p[0].toFixed(6) + ',' + p[1].toFixed(6);
+function gmapUrl(stops, preview = true, from = 'DEPOT', to = 'DEPOT'){
+  if (!stops.length) return '';
+  const U = S.V.users, fac = S.V.facility, pos = id => id === 'DEPOT' ? fac : [U[id].lat, U[id].lng];
+  let q = 'api=1';
+  const way = stops.slice(), dest = to ? pos(to) : pos(way.pop());   // 施設に戻らないときは最後の家が目的地
+  if (preview) q += '&origin=' + ll6(pos(from));
+  if (way.length) q += '&waypoints=' + way.map(u => ll6([U[u].lat, U[u].lng])).join('%7C');
+  q += '&destination=' + ll6(dest) + '&travelmode=driving';
+  if (!preview) q += '&dir_action=navigate';
+  return 'https://www.google.com/maps/dir/?' + q;
+}
+
+// ====================================================================
+//  保存（routes_<日付>_edit.csv / stops_<日付>_edit.csv）
+// ====================================================================
+async function save(){
+  const V = validateAll(), nBad = Object.values(V).reduce((a, x) => a + x.msgs.length, 0);
+  const nUn = S.V.waves.reduce((a, w) => a + unassigned(w.id).length, 0);
+  if ((nBad || nUn) && !confirm(`要確認 ${nBad} 件・未割当 ${nUn} 名があります。このまま保存しますか？`)) return;
+  const U = S.V.users, routes = [], stops = [];
+  const rs = S.routes.filter(r => r.stops.length).sort((a, b) => V[a.key].calc.start - V[b.key].calc.start);
+  let n = 1;
+  for (const r of rs){
+    const pt = partner(r);
+    if (pt && r.role === 'pick') continue;            // 連結の迎えは送りの行にまとめる
+    const k = V[r.key].calc, us = r.stops.map(u => U[u]);
+    if (!r.rid) r.rid = `${r.wave}#M${n++}`;
+    const sum = (xs, f) => xs.reduce((a, u) => a + u[f], 0);
+    if (pt){
+      const kp = V[pt.key].calc, ps = pt.stops.map(u => U[u]), all = r.stops.concat(pt.stops);
+      routes.push({route_id: r.rid, '便': `${r.wave}→${pt.wave}`, '職員': r.staff, '車': r.car, '施設出発': hm(k.start), '施設帰着': hm(kp.end),
+        '人数': Math.max(sum(us, 'seats'), sum(ps, 'seats')), '歩行器': Math.max(sum(us, 'walker'), sum(ps, 'walker')),
+        '車椅子': Math.max(sum(us, 'wheelchair'), sum(ps, 'wheelchair')), '最大介助': Math.max(...all.map(u => U[u].care_need)),
+        '走行分': k.drive + kp.drive, '順路': r.stops.join(' → ') + ' ⇒ ' + pt.stops.join(' → '),
+        'GoogleマップURL': gmapUrl(all, false), '確認用URL': gmapUrl(all, true)});
+      r.stops.forEach((u, i) => stops.push({route_id: r.rid, '職員': r.staff, '車': r.car, '順番': i + 1, '利用者': u, '到着予定': hm(k.eta[i]), '出発予定': hm(k.etd[i])}));
+      pt.stops.forEach((u, i) => stops.push({route_id: r.rid, '職員': r.staff, '車': r.car, '順番': r.stops.length + i + 1, '利用者': u, '到着予定': hm(kp.eta[i]), '出発予定': hm(kp.etd[i])}));
+      continue;
+    }
+    routes.push({route_id: r.rid, '便': r.wave, '職員': r.staff, '車': r.car, '施設出発': hm(k.start), '施設帰着': hm(k.end),
+      '人数': sum(us, 'seats'), '歩行器': sum(us, 'walker'), '車椅子': sum(us, 'wheelchair'),
+      '最大介助': Math.max(...us.map(u => u.care_need)), '走行分': k.drive, '順路': r.stops.join(' → '),
+      'GoogleマップURL': gmapUrl(r.stops, false), '確認用URL': gmapUrl(r.stops, true)});
+    r.stops.forEach((u, i) => stops.push({route_id: r.rid, '職員': r.staff, '車': r.car, '順番': i + 1, '利用者': u, '到着予定': hm(k.eta[i]), '出発予定': hm(k.etd[i])}));
+  }
+  const rc = ['route_id','便','職員','車','施設出発','施設帰着','人数','歩行器','車椅子','最大介助','走行分','順路','GoogleマップURL','確認用URL'];
+  const sc = ['route_id','職員','車','順番','利用者','到着予定','出発予定'];
+  try {
+    const a = await writeText(`output/routing/routes_${S.date}_edit.csv`, toCSV(rc, routes));
+    await writeText(`output/routing/stops_${S.date}_edit.csv`, toCSV(sc, stops));
+    S.dirty = false; S.fromEdit = true; S.undo = [];
+    render();
+    toast(a === 'saved' ? `保存しました（routes_${S.date}_edit.csv）` : 'CSVをダウンロードしました。output\\routing に置いてください');
+  } catch(e){
+    toast('保存できませんでした: ' + e.message + '（Excelで開いていたら閉じてください）');
+  }
+}
+
+// ====================================================================
+//  起動
+// ====================================================================
+window.addEventListener('keydown', e => { if (e.key === 'Escape' && S.sel.size && !/INPUT|SELECT/.test(e.target.tagName)) clearSel(); });
+window.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !/INPUT|SELECT/.test(e.target.tagName)){ e.preventDefault(); undo(); } });
+window.addEventListener('beforeunload', e => { if (S.dirty){ e.preventDefault(); e.returnValue = ''; } });
+(async () => {
+  renderCal(); initMap() && map.setView([36.2662, 137.9771], 13);
+  if (window.showDirectoryPicker && await idbGet('root')) $('bReopen').style.display = '';
+})();
+</script>
+</body>
+</html>
