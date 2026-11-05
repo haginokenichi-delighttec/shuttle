@@ -75,12 +75,12 @@ $env:GOOGLE_MAPS_API_KEY = "取得したAPIキー"
 ```
 shuttle/
 ├─ data/
-│  ├─ sample_routing/    入力データ（匿名ID）。現在は実データ寄りの内容
-│  │  ├─ *.csv              入力CSV（下表）
-│  │  ├─ travel_matrix.csv        Google API で取得した移動時間の表（fetch_matrix.bat で作成）
-│  │  ├─ travel_matrix_points.csv 取得時の座標（座標が変わった人を検出するため）
-│  │  └─ _before_fix/       整形前の元データ
-│  └─ real/              実データ（匿名化済みのみ・gitignore）
+│  ├─ sample_routing/    ダミーデータ（setup.bat / run_sample.bat が自動作成）
+│  └─ real/              実データ（convert_excel.bat で作成・gitignore）
+│     ├─ *.csv              入力CSV（下表）
+│     ├─ travel_matrix.csv        Google API で取得した移動時間の表（fetch_matrix.bat で作成）
+│     ├─ travel_matrix_points.csv 取得時の座標（座標が変わった人を検出するため）
+│     └─ _before_fix/       整形前の元データ（2026-10-23）
 ├─ src/shuttle_opt/routing/
 │  ├─ excel_import.py    送迎テンプレート（Excel）→ CSV 変換（氏名・備考列は読まない）
 │  ├─ data.py            CSV 読み込み、当日分の職員・車・利用者、便（到着時刻ごとの迎え／出発時刻ごとの送り）の生成
@@ -127,7 +127,7 @@ shuttle/
 | ng_pairs.csv | user_a, user_b（同じ車に同時に乗せない利用者の組。1行1組。ファイルがなければ制約なし） |
 
 - 日付は `2026-11-09` でも `2026/11/9` でも読み込める。時刻は `9:00` / `09:00` どちらでもよい。
-- care_need・walker・wheelchair・seats・service_min の空欄は、それぞれ 1・0・0・1・5分 として扱う。
+- care_need・walker・wheelchair・seats・service_min の空欄は、それぞれ 1・0・0・1・1分 として扱う（service_min の既定は config.py の default_service_min）。
 - user_id の重複は読み込み時にエラーで知らせる。
 - 便は「到着時刻ごとの迎え便」「出発時刻ごとの送り便」として自動で作る。到着時刻が違っても出発時刻が同じ人（例：13:30着と14:30着で、どちらも16:30発）は、送りでは同じ便になる。
 - 旧形式（attendance.csv に plan_id、別に plans.csv）も読み込める。plans.csv は新形式では使わない。
@@ -204,7 +204,7 @@ Google Routes API（computeRouteMatrix）で実際の道路の移動時間を取
 ```bat
 set GOOGLE_MAPS_API_KEY=取得したAPIキー
 fetch_matrix.bat --dry-run   … 件数・リクエスト回数・所要時間の目安だけ表示（APIは呼ばない）
-fetch_matrix.bat             … 取得して data\sample_routing\travel_matrix.csv を作る
+fetch_matrix.bat             … 取得して data\real\travel_matrix.csv を作る
 fetch_matrix.bat --refresh   … 全件取り直し
 ```
 
@@ -236,7 +236,7 @@ fetch_matrix.bat --refresh   … 全件取り直し
 |---|---|---|
 | シフト（「希望休_設定」の対象シート名、なければ「月次シフト」「○月_シフト」。生成対象=対象） | staff / shifts | 職員区分 → employment（「常勤」が残業の対象）。直行・直帰（1）と座標（自宅の緯度・経度）→ direct_start / direct_end / home_lat / home_lng。優先順位は大きいほど優先。シフト記号「日」= その職員の勤務開始/終了時間、「〇」・空欄 = 休み、その他 = 勤務パターンマスターの時刻 |
 | 車両情報 | cars | B列の車名を ID に。送迎可能人数 = 定員（利用者数）、歩行器積載。車名に「ヘルプ」を含む車はヘルプ車（help=1） |
-| 利用者情報 | users / attendance / ng_pairs | 施設着・施設発 = その日の到着・出発時刻（旧形式は 利用時間帯 = プランID）、介助 空欄/中/重 = 1/2/3、持参品「歩行器」= 歩行器あり、乗車必要時間（空欄は5分）、組み合わせ禁止（「P0013/P0007」形式） |
+| 利用者情報 | users / attendance / ng_pairs | 施設着・施設発 = その日の到着・出発時刻（旧形式は 利用時間帯 = プランID）、介助 空欄/中/重 = 1/2/3、持参品「歩行器」= 歩行器あり、乗車必要時間（空欄は1分）、組み合わせ禁止（「P0013/P0007」形式） |
 | 送迎情報 | plans | ID・到着時間・出発時間（旧形式で施設着・施設発が空欄のときだけ使う） |
 
 - 日によって座標が違う利用者は、最も新しい日の座標に統一します（警告あり）。介助・歩行器・乗車必要時間は日ごとの値を使います。
@@ -252,7 +252,7 @@ fetch_matrix.bat --refresh   … 全件取り直し
 
 医療機関の情報を扱うため、**入力データには氏名・住所・病名などの個人情報を含めず、匿名ID（S0100, P0001 など）で処理**してください。
 実データは `data/real/` に置く想定で、`.gitignore` により管理対象外にしています。ID と実名の対応表は本システムの外で管理してください。
-現在 `data/sample_routing/` には利用者宅の実座標が入っているため、`data/real/` への移動を推奨します。
+実データ（利用者宅の座標を含む）はすべて `data/real/` に置き、`data/sample_routing/` にはダミーデータだけを置きます。
 出力ファイル（URL を含む）や Google API の取得結果も個人情報として扱ってください。
 元の Excel（`00_doc/`・`*.xlsx`・`*.xlsm`）も `.gitignore` で管理対象外にしています。
 

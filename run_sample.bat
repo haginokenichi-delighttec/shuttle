@@ -1,7 +1,8 @@
 @echo off
-rem 送迎ルート最適化（ダミーデータ: data\sample_routing）で動作確認
-rem   run_sample.bat                      … ダミーデータの全日を計画
-rem   run_sample.bat 2026-11-04           … 指定した日だけ
+rem Shuttle route optimization with dummy data (data\sample_routing)
+rem   run_sample.bat                  (all dates of the dummy data)
+rem   run_sample.bat 2026-11-04       (specific dates)
+rem   NOTE: keep this file ASCII only (Japanese text breaks cmd.exe)
 chcp 65001 > nul
 cd /d %~dp0
 set PYTHONPATH=%~dp0src

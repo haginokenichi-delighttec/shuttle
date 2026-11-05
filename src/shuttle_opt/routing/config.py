@@ -38,6 +38,7 @@ class RoutingConfig:
     chain_pick_keep: int = 3     # 組み直した迎えを、人数ごとに何組残すか
 
     # 運用
+    default_service_min: int = 1 # 乗降時間（service_min）が空欄の利用者の乗降時間（分）。2026-11-05 5→1
     turnaround_min: int = 10     # ルートの間に必要な準備時間（職員・車とも）
     max_route_min: int = 120     # 1ルートの所要時間の上限（施設を出てから戻るまで）
     staff_before_pickup: int = 10   # 迎え便を担当できる職員: 施設到着時刻の何分前までに出勤しているか

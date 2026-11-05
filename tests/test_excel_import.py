@@ -115,14 +115,14 @@ def test_users_attendance_ng(converted):
     assert users.loc["P0002", "care_need"] == "2" and users.loc["P0002", "walker"] == "1"
     assert users.loc["P0002", "service_min"] == "10"
     assert users.loc["P0003", "care_need"] == "3"
-    assert users.loc["P0001", "service_min"] == ""                  # 空欄 → ソルバー側で既定5分
+    assert users.loc["P0001", "service_min"] == ""                  # 空欄 → ソルバー側で既定1分
     assert float(users.loc["P0001", "lat"]) == pytest.approx(35.005)   # 最新日の座標に統一
     assert any("座標" in w and "P0001" in w for w in warns)
     # 介助・歩行器は日ごとの値で計算する
     d1, d2 = load_day(out, "2026-12-01"), load_day(out, "2026-12-02")
     assert (d1.users["P0005"].walker, d1.users["P0005"].care_need) == (0, 1)
     assert (d2.users["P0005"].walker, d2.users["P0005"].care_need) == (1, 2)
-    assert d1.users["P0002"].service_min == 10 and d1.users["P0001"].service_min == 5
+    assert d1.users["P0002"].service_min == 10 and d1.users["P0001"].service_min == 1
     att = _csv(out / "attendance.csv")
     assert len(att) == 10
     ng = _csv(out / "ng_pairs.csv")

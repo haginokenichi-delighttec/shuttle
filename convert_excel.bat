@@ -1,15 +1,16 @@
 @echo off
 rem ============================================================
-rem  Excel（送迎テンプレート）→ data\real\ の CSV に変換
-rem    使い方1: このファイルに Excel をドラッグ＆ドロップ
-rem    使い方2: convert_excel.bat 送迎テンプレート.xlsm --facility 36.25,137.97
-rem             （--facility は施設の緯度,経度。初回だけ指定すれば次回からは不要）
-rem  ※ 氏名・備考の列は読み込みません
+rem  Excel (shuttle template) to CSV in data\real
+rem    Usage 1: drag and drop the Excel file onto this file
+rem    Usage 2: convert_excel.bat template.xlsm --facility 36.25,137.97
+rem             (--facility = facility lat,lng. Needed only the first time)
+rem  Name and note columns are not read.
+rem  NOTE: keep this file ASCII only (Japanese text breaks cmd.exe)
 rem ============================================================
 chcp 65001 > nul
 cd /d %~dp0
 if "%~1"=="" (
-    echo Excel ファイルを、この convert_excel.bat にドラッグ＆ドロップしてください。
+    echo Drag and drop the Excel file onto convert_excel.bat.
     pause
     exit /b 1
 )

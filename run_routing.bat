@@ -1,13 +1,14 @@
 @echo off
-rem 送迎ルート最適化（実データ: data\real）
-rem   run_routing.bat                     … attendance.csv にある全日を計画
-rem   run_routing.bat 2026-11-09          … 指定した日だけ（複数可）
-rem   run_routing.bat --early 45          … 全日をオプション付きで
-rem   ※ 先に convert_excel.bat で Excel を CSV に変換しておくこと
+rem Shuttle route optimization (real data: data\real)
+rem   run_routing.bat                 (all dates in attendance.csv)
+rem   run_routing.bat 2026-11-09      (specific dates)
+rem   run_routing.bat --early 45      (all dates with options)
+rem   Convert the Excel file with convert_excel.bat first.
+rem   NOTE: keep this file ASCII only (Japanese text breaks cmd.exe)
 chcp 65001 > nul
 cd /d %~dp0
 if not exist data\real\attendance.csv (
-    echo data\real に CSV がありません。先に convert_excel.bat で Excel を変換してください。
+    echo [ERROR] No CSV in data\real. Convert the Excel file with convert_excel.bat first.
     pause
     exit /b 1
 )

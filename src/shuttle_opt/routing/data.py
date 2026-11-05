@@ -157,7 +157,7 @@ def list_dates(data_dir: str | Path) -> list[str]:
 
 
 def load_day(data_dir: str | Path, date: str, cfg=None) -> DayProblem:
-    """cfg: RoutingConfig（残業の設定に使う。省略時は既定値）."""
+    """cfg: RoutingConfig（残業・乗降時間の既定値に使う。省略時は既定値）."""
     from .config import RoutingConfig
     cfg = cfg or RoutingConfig()
     d = Path(data_dir)
@@ -250,7 +250,7 @@ def load_day(data_dir: str | Path, date: str, cfg=None) -> DayProblem:
             u = r.user_id
             a, dep = times[u]
             users[u] = User(u, float(r.lat), float(r.lng), attr(u, r, "care_need", 1),
-                            attr(u, r, "walker", 0), _int(r.seats, 1), attr(u, r, "service_min", 5),
+                            attr(u, r, "walker", 0), _int(r.seats, 1), attr(u, r, "service_min", cfg.default_service_min),
                             a, dep, attr(u, r, "wheelchair", 0))
     missing = set(times) - set(users)
     if missing:

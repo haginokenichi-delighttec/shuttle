@@ -88,7 +88,7 @@ def test_date_and_blank_normalization(tmp_path):
            [("C1", 4, 0, "")], [("P1", "9:00", "12:00")], [("2026/12/01", "U1", "P1")])
     day = load_day(tmp_path, DATE)
     u = day.users["U1"]
-    assert (u.care_need, u.walker, u.wheelchair, u.seats, u.service_min) == (1, 0, 0, 1, 5)
+    assert (u.care_need, u.walker, u.wheelchair, u.seats, u.service_min) == (1, 0, 0, 1, 1)
     assert "S1" in day.staff
 
 

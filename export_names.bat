@@ -1,13 +1,14 @@
 @echo off
 rem ============================================================
-rem  送迎表ビューア用の氏名名簿（data\real\names.csv）を作る
-rem    使い方: このファイルに Excel（送迎テンプレート）をドラッグ＆ドロップ
-rem  ※ 氏名を含むファイルです。外部に出さないでください
+rem  Create the name list for the viewer (data\real\names.csv)
+rem    Usage: drag and drop the Excel file (shuttle template) onto this file
+rem  The output contains names. Do not share it outside.
+rem  NOTE: keep this file ASCII only (Japanese text breaks cmd.exe)
 rem ============================================================
 chcp 65001 > nul
 cd /d %~dp0
 if "%~1"=="" (
-    echo Excel ファイルを、この export_names.bat にドラッグ＆ドロップしてください。
+    echo Drag and drop the Excel file onto export_names.bat.
     pause
     exit /b 1
 )
